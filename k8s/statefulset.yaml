@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sandbox-runner
+  namespace: sendai
+spec:
+  serviceName: sandbox-runner
+  replicas: 8
+  selector:
+    matchLabels:
+      app: sandbox-runner
+  template:
+    metadata:
+      labels:
+        app: sandbox-runner
+    spec:
+      serviceAccountName: sendai-api
+      # No auto-mount of SA token into sandbox pods (least privilege)
+      automountServiceAccountToken: false
+      containers:
+        - name: sandbox
+          image: node:22-alpine
+          command: ["sh", "-c", "mkdir -p /sandbox && sleep infinity"]
+          workingDir: /sandbox
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # /sandbox needs writes
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sandbox-data
+              mountPath: /sandbox
+      volumes:
+        - name: sandbox-data
+          emptyDir: {}
+---
+# Headless service for stable DNS (sandbox-runner-0.sandbox-runner.sendai.svc)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-runner
+  namespace: sendai
+spec:
+  clusterIP: None
+  selector:
+    app: sandbox-runner
+  ports:
+    - port: 80
+      name: placeholder

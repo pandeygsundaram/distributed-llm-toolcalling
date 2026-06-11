@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sendai-worker
+  namespace: sendai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sendai-worker
+  template:
+    metadata:
+      labels:
+        app: sendai-worker
+    spec:
+      serviceAccountName: sendai-api
+      containers:
+        - name: worker
+          image: sendai:latest
+          imagePullPolicy: Never   # use local minikube image
+          command: ["node", "dist/worker/index.js"]
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: K8S_NAMESPACE
+              value: "sendai"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sendai-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sendai-api
+  namespace: sendai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sendai-api
+  template:
+    metadata:
+      labels:
+        app: sendai-api
+    spec:
+      serviceAccountName: sendai-api
+      containers:
+        - name: api
+          image: sendai:latest
+          imagePullPolicy: Never   # use local minikube image
+          ports:
+            - containerPort: 3000
+          env:
+            - name: USE_REDIS
+              value: "true"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: K8S_NAMESPACE
+              value: "sendai"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sendai-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: NODE_ENV
+              value: "production"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sendai-api
+  namespace: sendai
+spec:
+  selector:
+    app: sendai-api
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: NodePort
