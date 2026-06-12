@@ -1,17 +1,22 @@
-import type { FastifyInstance } from "fastify";
+import type { Router, Request, Response } from "express";
+import { Router as createRouter } from "express";
 import type { LeaseManager } from "../sandbox/lease-manager.js";
 
-export function registerPodsRoutes(app: FastifyInstance, leaseManager: LeaseManager | null) {
-  app.get("/pods", async (_req, reply) => {
+export function registerPodsRoutes(leaseManager: LeaseManager | null): Router {
+  const router = createRouter();
+
+  router.get("/pods", async (_req: Request, res: Response) => {
     if (!leaseManager) {
-      return reply.send({
-        phase: "1-local",
-        pods: [],
-        note: "Pod pool not available in Phase 1.",
-      });
+      res.json({ phase: "1-local", pods: [], note: "Pod pool not available in Phase 1." });
+      return;
     }
 
-    const pods = await leaseManager.listLeaseStates();
-    return reply.send({ pods });
+    const [pods, queue] = await Promise.all([
+      leaseManager.listLeaseStates(),
+      Promise.resolve(leaseManager.queueInfo()),
+    ]);
+    res.json({ pods, queue });
   });
+
+  return router;
 }
