@@ -5,6 +5,7 @@ import { logger } from "../logger.js";
 export const STREAM_KEY = "tool-calls";
 export const CONSUMER_GROUP = "workers";
 export const RESULT_CHANNEL = (toolCallId: string) => `result:${toolCallId}`;
+export const POD_FREED_CHANNEL = (toolCallId: string) => `pods:freed:${toolCallId}`;
 
 // Two separate clients — one for blocking reads, one for pub/sub (both can't do other ops while blocked)
 let _stream: Redis | null = null;
@@ -127,6 +128,38 @@ export class CapacityTimeoutError extends Error {
     super("No sandbox pod became available within the timeout period.");
     this.name = "CapacityTimeoutError";
   }
+}
+
+// Wait until the specific pod for this toolCallId is freed (or timeout — resolves anyway)
+export function waitForPodFreed(toolCallId: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sub = newSubClient();
+    const channel = POD_FREED_CHANNEL(toolCallId);
+    let settled = false;
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      sub.unsubscribe(channel).finally(() => sub.disconnect());
+      resolve();
+    };
+
+    const timer = setTimeout(done, timeoutMs);
+
+    sub.subscribe(channel, (err) => {
+      if (err) {
+        clearTimeout(timer);
+        settled = true;
+        sub.disconnect();
+        reject(err);
+      }
+    });
+
+    sub.on("message", () => {
+      clearTimeout(timer);
+      done();
+    });
+  });
 }
 
 export async function disconnectAll(): Promise<void> {
