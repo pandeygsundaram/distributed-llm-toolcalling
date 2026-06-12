@@ -5,8 +5,10 @@ import { logger } from "../logger.js";
 import { config } from "../config.js";
 import {
   getStreamClient,
+  getPubClient,
   ensureConsumerGroup,
   publishResult,
+  POD_FREED_CHANNEL,
   STREAM_KEY,
   CONSUMER_GROUP,
   type ToolCallJob,
@@ -43,9 +45,13 @@ async function processJob(streamId: string, job: ToolCallJob): Promise<void> {
 
   try {
     // Acquire a pod lease (may queue if all 8 are busy)
-    podName = await leaseManager.acquirePod(context);
+    const acquired = await leaseManager.acquirePod(context);
+    podName = acquired.pod;
 
-    log.info({ pod: podName }, "worker.pod.acquired");
+    log.info({ pod: podName, queuePosition: acquired.queuePosition, waitMs: acquired.waitMs }, "worker.pod.acquired");
+
+    // Annotate pod with current tool call id for kubectl observability
+    await leaseManager.annotatePod(podName, job.toolCallId);
 
     // Execute the tool inside the pod
     const result = await podExecutor.run(podName, job.tool, job.input, config.TOOL_TIMEOUT_MS);
@@ -54,31 +60,48 @@ async function processJob(streamId: string, job: ToolCallJob): Promise<void> {
       ? result.stdout || "(empty output)"
       : `Exit ${result.exitCode}:\n${result.stderr || result.stdout}`;
 
+    const completedPod = podName;
+    const durationMs = Date.now() - start;
+
+    // Step 1: publish result → caller gets the output immediately
     await publishResult(job.toolCallId, {
       toolCallId: job.toolCallId,
       tool: job.tool,
       output,
       status: result.exitCode === 0 ? "completed" : "failed",
-      pod: podName,
-      durationMs: Date.now() - start,
+      pod: completedPod,
+      durationMs,
     });
 
-    log.info({ pod: podName, durationMs: Date.now() - start }, "worker.job.completed");
+    // Step 2: release the lease so the next waiter can acquire this pod
+    await leaseManager.clearAnnotations(completedPod);
+    await leaseManager.releasePod(completedPod);
+    podName = null; // prevent double-release in finally
+
+    // Step 3: notify this specific caller that its pod is now freed
+    await getPubClient().publish(POD_FREED_CHANNEL(job.toolCallId), completedPod);
+
+    log.info({ pod: completedPod, durationMs }, "worker.job.completed");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error({ pod: podName, error: message, durationMs: Date.now() - start }, "worker.job.failed");
+    const failedPod = podName ?? "unassigned";
+    log.error({ pod: failedPod, error: message, durationMs: Date.now() - start }, "worker.job.failed");
 
     await publishResult(job.toolCallId, {
       toolCallId: job.toolCallId,
       tool: job.tool,
       output: `Error: ${message}`,
       status: "failed",
-      pod: podName ?? "unassigned",
+      pod: failedPod,
       durationMs: Date.now() - start,
     });
   } finally {
+    // Safety net: release lease if still held (e.g. error during publishResult itself)
     if (podName) {
-      await leaseManager.releasePod(podName);
+      await leaseManager.clearAnnotations(podName).catch(() => {});
+      await leaseManager.releasePod(podName).catch(() => {});
+      await getPubClient().publish(POD_FREED_CHANNEL(job.toolCallId), podName).catch(() => {});
+      podName = null;
     }
   }
 }
