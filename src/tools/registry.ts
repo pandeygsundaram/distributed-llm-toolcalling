@@ -12,6 +12,7 @@ export const toolDefinitions: Tool[] = [
 export const TOOL_NAMES = {
   SHELL_RUN: "shell_run",
   FS_READ: "fs_read",
+  FS_WRITE: "fs_write",
   ENV_INSPECT: "env_inspect",
 } as const;
 

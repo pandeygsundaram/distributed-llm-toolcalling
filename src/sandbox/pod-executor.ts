@@ -62,6 +62,15 @@ export class PodExecutor {
         return ["sh", "-c", `cat '${SANDBOX_DIR}/${filePath}'`];
       }
 
+      case TOOL_NAMES.FS_WRITE: {
+        const filePath = input.filePath as string;
+        if (filePath.includes("..") || filePath.startsWith("/")) {
+          throw new Error("Path traversal or absolute path rejected");
+        }
+        const content = (input.content as string).replace(/'/g, "'\\''");
+        return ["sh", "-c", `printf '%s' '${content}' > '${SANDBOX_DIR}/${filePath}'`];
+      }
+
       case TOOL_NAMES.ENV_INSPECT: {
         return ["sh", "-c",
           `printf '{"hostname":"%s","user":"%s","workingDirectory":"${SANDBOX_DIR}","podName":"%s","namespace":"%s"}' ` +
