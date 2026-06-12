@@ -1,16 +1,24 @@
-import Fastify from "fastify";
+import http from "http";
+import express from "express";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { LocalExecutor } from "./executor/local.js";
 import { RedisExecutor } from "./executor/redis.js";
-import { AnthropicClient } from "./anthropic/client.js";
+import { PiClient } from "./pi/client.js";
 import { LeaseManager } from "./sandbox/lease-manager.js";
+import { broadcaster } from "./ws/broadcaster.js";
+import { metrics } from "./metrics/index.js";
 import { registerChatRoutes } from "./routes/chat.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerPodsRoutes } from "./routes/pods.js";
+import { registerMetricsRoutes } from "./routes/metrics.js";
+import { registerExecutionRoutes } from "./routes/executions.js";
+import { registerCancelRoutes } from "./routes/cancel.js";
+import { registerChatHistoryRoutes } from "./routes/chats.js";
+import { registerApprovalRoutes } from "./routes/approve.js";
 
 async function main() {
-  const useRedis = process.env.USE_REDIS === "true";
+  const useRedis = config.USE_REDIS === "true";
 
   let executor: LocalExecutor | RedisExecutor;
   let leaseManager: LeaseManager | null = null;
@@ -25,21 +33,50 @@ async function main() {
     await (executor as LocalExecutor).init();
   }
 
-  const anthropicClient = new AnthropicClient(executor);
+  const piClient = new PiClient(executor);
 
-  const app = Fastify({ logger: false });
-
-  app.setErrorHandler((err, _req, reply) => {
-    logger.error({ err }, "unhandled request error");
-    reply.status(500).send({ error: "internal server error" });
+  const app = express();
+  app.use(express.json());
+  app.use((_req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
+    next();
   });
 
-  registerHealthRoutes(app, leaseManager);
-  registerPodsRoutes(app, leaseManager);
-  registerChatRoutes(app, anthropicClient);
+  app.use(registerHealthRoutes(leaseManager));
+  app.use(registerPodsRoutes(leaseManager));
+  app.use(registerChatRoutes(piClient));
+  app.use(registerMetricsRoutes());
+  app.use(registerExecutionRoutes());
+  app.use(registerCancelRoutes());
+  app.use(registerChatHistoryRoutes());
+  app.use(registerApprovalRoutes());
 
-  await app.listen({ port: config.PORT, host: "0.0.0.0" });
-  logger.info({ port: config.PORT, mode: useRedis ? "redis" : "local" }, "server started");
+  app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    logger.error({ err }, "unhandled error");
+    res.status(500).json({ error: "internal server error" });
+  });
+
+  const server = http.createServer(app);
+  broadcaster.attach(server);
+
+  // Broadcast pod + metrics state every 2s to connected WebSocket clients
+  setInterval(async () => {
+    if (broadcaster.clientCount() === 0) return;
+    if (leaseManager) {
+      const pods = await leaseManager.listLeaseStates().catch(() => []);
+      const inUse = pods.filter(p => p.lease.status === "leased").length;
+      metrics.setPodsInUse(inUse);
+      broadcaster.broadcast({ type: "pods_update", data: { pods } });
+    }
+    broadcaster.broadcast({ type: "metrics_update", data: metrics.snapshot() });
+  }, 2000);
+
+  server.listen(config.PORT, "0.0.0.0", () => {
+    logger.info({ port: config.PORT, mode: useRedis ? "redis" : "local" }, "server started");
+  });
 }
 
 main().catch((err) => {

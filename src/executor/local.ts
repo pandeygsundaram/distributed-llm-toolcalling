@@ -23,6 +23,8 @@ export interface ToolCallResult {
   executedIn: "local" | "pod";
   pod?: string;
   durationMs: number;
+  queuePosition?: number;
+  queueWaitMs?: number;
 }
 
 export class LocalExecutor {

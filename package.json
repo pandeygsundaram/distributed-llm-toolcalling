@@ -10,25 +10,39 @@
     "start:worker": "node --import tsx/esm src/worker/index.ts",
     "build": "tsc",
     "test": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration",
-    "stress": "tsx tests/stress/stress.ts"
+    "test:integration": "vitest run tests/integration/api.test.ts --reporter=verbose",
+    "test:approval": "vitest run tests/integration/approval.test.ts --reporter=verbose",
+    "stress": "tsx tests/stress/stress.ts",
+    "stress:concurrent": "tsx tests/stress/concurrent.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
+    "@earendil-works/pi-coding-agent": "^0.74.2",
     "@kubernetes/client-node": "^1.0.0",
-    "fastify": "^5.2.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.10.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.2.1",
     "ioredis": "^5.4.2",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
-    "zod": "^3.24.2",
-    "dotenv": "^16.5.0",
-    "uuid": "^11.1.0"
+    "typebox": "^1.2.8",
+    "uuid": "^11.1.0",
+    "ws": "^8.21.0",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",
+    "@types/supertest": "^7.2.0",
     "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "supertest": "^7.2.2",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3",
     "vitest": "^3.1.4"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.10.0": true
   }
 }
