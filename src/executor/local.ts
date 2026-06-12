@@ -5,6 +5,7 @@ import { logger } from "../logger.js";
 import { shellRun } from "../tools/shell-run.js";
 import { fsRead } from "../tools/fs-read.js";
 import { envInspect } from "../tools/env-inspect.js";
+import { mathCompute, type MathComputeInput } from "../tools/math-compute.js";
 import { TOOL_NAMES, type ToolName } from "../tools/registry.js";
 
 export interface ToolCallRequest {
@@ -92,6 +93,9 @@ export class LocalExecutor {
 
       case TOOL_NAMES.ENV_INSPECT:
         return envInspect(this.sandboxDir);
+
+      case TOOL_NAMES.MATH_COMPUTE:
+        return mathCompute(input as unknown as MathComputeInput);
 
       default:
         throw new Error(`Unknown tool: ${tool}`);

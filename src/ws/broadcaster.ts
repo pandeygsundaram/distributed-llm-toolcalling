@@ -5,6 +5,7 @@ import { logger } from "../logger.js";
 type WSEvent =
   | { type: "pods_update"; data: unknown }
   | { type: "execution_update"; data: unknown }
+  | { type: "tool_call_update"; data: unknown }
   | { type: "metrics_update"; data: unknown }
   | { type: "queue_update"; data: { depth: number; waiters: number } }
   | { type: "permission_request"; data: unknown };

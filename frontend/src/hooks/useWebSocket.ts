@@ -1,9 +1,25 @@
 import { useEffect, useRef, useCallback } from "react";
 
+export interface ToolCallLiveEvent {
+  toolCallId: string;
+  tool: string;
+  input: Record<string, unknown>;
+  output: string;
+  status: "completed" | "failed";
+  executedIn: "local" | "pod";
+  pod?: string;
+  durationMs: number;
+  sessionId: string;
+  requestId: string;
+  queuePosition?: number;
+  queueWaitMs?: number;
+}
+
 export type WSEvent =
   | { type: "pods_update"; data: { pods: PodState[] } }
   | { type: "metrics_update"; data: MetricsSnapshot }
   | { type: "execution_update"; data: ExecutionRecord }
+  | { type: "tool_call_update"; data: ToolCallLiveEvent }
   | { type: "queue_update"; data: { depth: number; waiters: number } }
   | { type: "permission_request"; data: unknown };
 
