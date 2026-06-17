@@ -3,3 +3,7 @@ dist
 .env
 .claude
 
+*.db
+*.db-shm
+*.db-wal
+*.png
