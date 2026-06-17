@@ -4,7 +4,7 @@ metadata:
   name: sendai-api
   namespace: sendai
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: sendai-api
@@ -17,16 +17,24 @@ spec:
       containers:
         - name: api
           image: sendai:latest
-          imagePullPolicy: Never   # use local minikube image
+          imagePullPolicy: Never
           ports:
             - containerPort: 3000
           env:
             - name: USE_REDIS
               value: "true"
             - name: REDIS_URL
-              value: "redis://redis:6379"
+              valueFrom:
+                secretKeyRef:
+                  name: sendai-secrets
+                  key: REDIS_URL
             - name: K8S_NAMESPACE
               value: "sendai"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sendai-secrets
+                  key: DATABASE_URL
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -34,10 +42,12 @@ spec:
                   key: ANTHROPIC_API_KEY
             - name: NODE_ENV
               value: "production"
+            - name: POD_DISCOVERY_INTERVAL_MS
+              value: "10000"
           resources:
             requests:
               cpu: "100m"
-              memory: "128Mi"
+              memory: "256Mi"
             limits:
               cpu: "500m"
               memory: "512Mi"
@@ -47,6 +57,12 @@ spec:
               port: 3000
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 30
 ---
 apiVersion: v1
 kind: Service
@@ -56,6 +72,12 @@ metadata:
 spec:
   selector:
     app: sendai-api
+  # Sticky sessions: SSE connections from the same client always hit the same replica
+  # so the in-memory Pi session Map stays consistent
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600  # 1hr — matches Pi session lifetime
   ports:
     - port: 3000
       targetPort: 3000
