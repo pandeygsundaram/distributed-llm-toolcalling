@@ -1,0 +1,45 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sandbox-runner-hpa
+  namespace: sendai
+spec:
+  # Scale the sandbox pod pool — more pods = more parallel tool executions
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: sandbox-runner
+  minReplicas: 4
+  maxReplicas: 32
+  metrics:
+    # Primary: scale up when queue depth exceeds 2 waiting jobs per pod
+    - type: External
+      external:
+        metric:
+          name: redis_stream_length
+          selector:
+            matchLabels:
+              stream: tool-calls
+        target:
+          type: AverageValue
+          averageValue: "2"
+    # Secondary: CPU-based scaling (no prometheus-adapter required)
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30   # scale up quickly when queue fills
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # scale down slowly — avoid thrash
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 120

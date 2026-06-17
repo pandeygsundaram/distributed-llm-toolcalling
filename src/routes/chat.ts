@@ -7,6 +7,8 @@ import { chatStore } from "../history/chat-store.js";
 import { metrics } from "../metrics/index.js";
 import { broadcaster } from "../ws/broadcaster.js";
 import { logger } from "../logger.js";
+import { getLockClient, SESSION_INFLIGHT_KEY } from "../queue/redis-client.js";
+import { config } from "../config.js";
 
 // Simple sliding-window rate limiter: 20 requests per 60s per IP
 const RATE_LIMIT = 20;
@@ -42,17 +44,36 @@ export function registerChatRoutes(client: PiClient): Router {
       return;
     }
 
+    // Per-session concurrency limit — prevents one session from starving the pod pool
+    const lockClient = getLockClient();
+    const inflightKey = SESSION_INFLIGHT_KEY(sessionId);
+    const inflight = await lockClient.incr(inflightKey);
+    await lockClient.expire(inflightKey, 300); // 5-min safety TTL
+
+    if (inflight > config.MAX_SESSION_INFLIGHT) {
+      await lockClient.decr(inflightKey);
+      res.status(429).json({
+        error: "too many concurrent requests for this session",
+        limit: config.MAX_SESSION_INFLIGHT,
+      });
+      return;
+    }
+
     const requestId = uuid();
     const signal = cancellationManager.register(requestId, sessionId);
     const start = Date.now();
 
-    // Save user message
-    chatStore.addMessage({ id: uuid(), sessionId, role: "user", content: message, createdAt: new Date().toISOString() });
+    await chatStore.addMessage({
+      id: uuid(),
+      sessionId,
+      role: "user",
+      content: message,
+      createdAt: new Date().toISOString(),
+    });
 
     try {
       const result = await client.runChat({ sessionId, message, requestId, signal });
 
-      // Record each tool call in execution store + metrics
       for (const tc of result.toolCalls) {
         const record = {
           id: uuid(),
@@ -60,22 +81,23 @@ export function registerChatRoutes(client: PiClient): Router {
           sessionId,
           toolCallId: tc.toolCallId,
           tool: tc.tool,
-          input: {},
-          output: "",
+          input: tc.input,
+          output: tc.output,
           pod: tc.pod ?? "local",
           status: tc.status,
           startedAt: new Date(start).toISOString(),
           finishedAt: new Date().toISOString(),
           durationMs: tc.durationMs,
         };
-        executionStore.add(record);
-        metrics.recordToolExecution(tc.tool, tc.durationMs);
+        await executionStore.add(record);
+        metrics.recordToolExecution(tc.tool, tc.durationMs, tc.status);
         broadcaster.broadcast({ type: "execution_update", data: record });
       }
 
-      // Save assistant response
-      chatStore.addMessage({
-        id: uuid(), sessionId, role: "assistant",
+      await chatStore.addMessage({
+        id: uuid(),
+        sessionId,
+        role: "assistant",
         content: result.message,
         toolCalls: JSON.stringify(result.toolCalls),
         createdAt: new Date().toISOString(),
@@ -92,6 +114,7 @@ export function registerChatRoutes(client: PiClient): Router {
       }
     } finally {
       cancellationManager.complete(requestId);
+      await lockClient.decr(inflightKey).catch(() => {});
     }
   });
 

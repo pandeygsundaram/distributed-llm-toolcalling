@@ -3,18 +3,33 @@ import { config } from "../config.js";
 import { logger } from "../logger.js";
 
 export const STREAM_KEY = "tool-calls";
+export const DLQ_KEY = "tool-calls:dlq";
 export const CONSUMER_GROUP = "workers";
 export const RESULT_CHANNEL = (toolCallId: string) => `result:${toolCallId}`;
 export const POD_FREED_CHANNEL = (toolCallId: string) => `pods:freed:${toolCallId}`;
+export const POD_LOCK_KEY = (podName: string) => `pod:lock:${podName}`;
+export const SESSION_INFLIGHT_KEY = (sessionId: string) => `session:inflight:${sessionId}`;
+
+function makeRedis(): Redis {
+  if (config.REDIS_SENTINEL_URLS) {
+    const sentinels = config.REDIS_SENTINEL_URLS.split(",").map((s) => {
+      const [host, port] = s.trim().split(":");
+      return { host, port: parseInt(port ?? "26379", 10) };
+    });
+    return new Redis({ sentinels, name: "mymaster", lazyConnect: false });
+  }
+  return new Redis(config.REDIS_URL, { lazyConnect: false });
+}
 
 // Two separate clients — one for blocking reads, one for pub/sub (both can't do other ops while blocked)
 let _stream: Redis | null = null;
 let _pubsub: Redis | null = null;
 let _pub: Redis | null = null;
+let _lock: Redis | null = null;
 
 export function getStreamClient(): Redis {
   if (!_stream) {
-    _stream = new Redis(config.REDIS_URL, { lazyConnect: false });
+    _stream = makeRedis();
     _stream.on("error", (e) => logger.error({ err: e.message }, "redis stream error"));
   }
   return _stream;
@@ -22,14 +37,23 @@ export function getStreamClient(): Redis {
 
 export function getPubClient(): Redis {
   if (!_pub) {
-    _pub = new Redis(config.REDIS_URL, { lazyConnect: false });
+    _pub = makeRedis();
     _pub.on("error", (e) => logger.error({ err: e.message }, "redis pub error"));
   }
   return _pub;
 }
 
+// Dedicated client for pod locks and session counters (not blocked by stream reads)
+export function getLockClient(): Redis {
+  if (!_lock) {
+    _lock = makeRedis();
+    _lock.on("error", (e) => logger.error({ err: e.message }, "redis lock error"));
+  }
+  return _lock;
+}
+
 export function newSubClient(): Redis {
-  const sub = new Redis(config.REDIS_URL, { lazyConnect: false });
+  const sub = makeRedis();
   sub.on("error", (e) => logger.error({ err: e.message }, "redis sub error"));
   return sub;
 }
@@ -167,5 +191,6 @@ export async function disconnectAll(): Promise<void> {
     _stream?.quit(),
     _pub?.quit(),
     _pubsub?.quit(),
+    _lock?.quit(),
   ]);
 }

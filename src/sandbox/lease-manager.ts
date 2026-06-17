@@ -1,13 +1,8 @@
 import * as k8s from "@kubernetes/client-node";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-
-// Kubernetes MicroTime requires 6 decimal places (microseconds), not 3 (milliseconds)
-function microTime(): string {
-  return new Date().toISOString().replace(/(\.\d{3})Z$/, "$1000Z");
-}
-
-const POD_NAMES = Array.from({ length: 8 }, (_, i) => `sandbox-runner-${i}`);
+import { getLockClient, POD_LOCK_KEY } from "../queue/redis-client.js";
+import type { Redis } from "ioredis";
 
 export interface LeaseContext {
   instanceId: string;
@@ -25,44 +20,63 @@ interface Waiter {
 
 export interface AcquireResult {
   pod: string;
-  queuePosition: number;  // 0 = got pod immediately, >0 = waited N positions
+  queuePosition: number;
   waitMs: number;
 }
 
+export interface PodLeaseState {
+  name: string;
+  lease:
+    | { status: "free" }
+    | { status: "leased"; holderIdentity: string; expiresAt: string }
+    | { status: "unknown" };
+}
+
+export class QueueTimeoutError extends Error {
+  readonly code = "sandbox_capacity_timeout";
+  constructor() {
+    super("No sandbox pod became available within 15 seconds.");
+    this.name = "QueueTimeoutError";
+  }
+}
+
 export class LeaseManager {
-  private readonly coordApi: k8s.CoordinationV1Api;
   private readonly coreApi: k8s.CoreV1Api;
+  private readonly lockClient: Redis;
   private readonly namespace: string;
-  private readonly leaseTtlSeconds: number;
+  private readonly leaseTtlMs: number;
   private readonly maxWaitMs: number;
   private readonly waiters: Waiter[] = [];
-  // Optimistic in-process reservation — prevents concurrent jobs from racing on the
-  // same pod and generating K8s 409s. Node.js is single-threaded so the has+add below
-  // is atomic; the K8s lease remains the authoritative lock for multi-replica safety.
-  private readonly inMemoryHeld = new Set<string>();
+
+  // Starts with static fallback; overwritten by K8s discovery every 10s
+  private podNames: string[] = Array.from({ length: 8 }, (_, i) => `sandbox-runner-${i}`);
+
+  private discoveryInterval?: NodeJS.Timeout;
   private watchdogInterval?: NodeJS.Timeout;
 
   constructor() {
     const kc = new k8s.KubeConfig();
     kc.loadFromDefault();
-    this.coordApi = kc.makeApiClient(k8s.CoordinationV1Api);
     this.coreApi = kc.makeApiClient(k8s.CoreV1Api);
+    this.lockClient = getLockClient();
     this.namespace = config.K8S_NAMESPACE;
-    this.leaseTtlSeconds = config.LEASE_TTL_SECONDS;
+    this.leaseTtlMs = config.LEASE_TTL_SECONDS * 1000;
     this.maxWaitMs = config.QUEUE_MAX_WAIT_MS;
+    this.startPodDiscovery();
     this.startWatchdog();
   }
 
-  // Returns queue depth + estimated wait for callers that want to show it before queuing
   queueInfo(): { depth: number; estimatedWaitMs: number } {
-    const avgToolMs = 3000; // conservative avg tool exec time
+    const avgToolMs = 3000;
     return { depth: this.waiters.length, estimatedWaitMs: this.waiters.length * avgToolMs };
   }
 
-  // Try all pods; if all busy, enqueue and wait up to maxWaitMs
+  get queueDepth(): number {
+    return this.waiters.length;
+  }
+
   async acquirePod(context: LeaseContext): Promise<AcquireResult> {
-    logger.info({ ...context }, "sandbox.lease.acquire.attempted");
-    const queueSnapshot = this.waiters.length;
+    logger.info({ ...context }, "sandbox.lock.acquire.attempted");
 
     const pod = await this.tryAcquireAny(context);
     if (pod) return { pod, queuePosition: 0, waitMs: 0 };
@@ -70,7 +84,6 @@ export class LeaseManager {
     logger.info({ ...context, queueDepth: this.waiters.length }, "sandbox.queue.wait.started");
 
     return new Promise<AcquireResult>((resolve, reject) => {
-      const position = this.waiters.length + 1;
       const waiter: Waiter = {
         context,
         resolve: (p, queuePosition, waitMs) => resolve({ pod: p, queuePosition, waitMs }),
@@ -89,61 +102,51 @@ export class LeaseManager {
     });
   }
 
-  // How many jobs are queued waiting for a pod
-  get queueDepth(): number {
-    return this.waiters.length;
+  // Renew the Redis TTL for a held pod — called by the worker heartbeat every LEASE_TTL/3
+  async renewLease(podName: string): Promise<void> {
+    const result = await this.lockClient.pexpire(POD_LOCK_KEY(podName), this.leaseTtlMs);
+    if (result === 0) {
+      logger.warn({ pod: podName }, "sandbox.lock.renew.key-missing — lock already expired");
+    }
   }
 
   async releasePod(podName: string): Promise<void> {
-    await this.clearLease(podName);
-    // Pod stays in inMemoryHeld until we either hand it to a waiter or fully free it.
-    // This prevents a concurrent tryAcquireAny from stealing the pod mid-handoff.
+    await this.lockClient.del(POD_LOCK_KEY(podName));
 
     const waiter = this.waiters.shift();
     if (!waiter) {
-      this.inMemoryHeld.delete(podName);
-      logger.info({ pod: podName }, "sandbox.lease.released");
+      logger.info({ pod: podName }, "sandbox.lock.released");
       return;
     }
 
     const waitMs = Date.now() - waiter.enqueueTime;
-    const queuePosition = 1;
-    logger.info({ ...waiter.context, waitMs, pod: podName }, "sandbox.queue.wait.completed");
-
-    try {
-      await this.acquireLease(podName, waiter.context);
-      // inMemoryHeld still contains podName — now held for the new owner
-      waiter.resolve(podName, queuePosition, waitMs);
-    } catch {
-      // Lease conflict from another worker replica — release in-memory hold and find another pod
-      this.inMemoryHeld.delete(podName);
+    const acquired = await this.tryAcquirePod(podName, waiter.context);
+    if (acquired) {
+      logger.info({ pod: podName, ...waiter.context, waitMs }, "sandbox.queue.wait.completed");
+      waiter.resolve(podName, 1, waitMs);
+    } else {
+      // Another worker grabbed this pod first — put waiter back and try any available pod
       this.waiters.unshift(waiter);
-      const result = await this.tryAcquireAny(waiter.context);
-      if (result) {
+      const pod = await this.tryAcquireAny(waiter.context);
+      if (pod) {
         this.waiters.shift();
-        waiter.resolve(result, queuePosition, waitMs);
+        waiter.resolve(pod, 1, waitMs);
       }
     }
   }
 
-  // Returns current state of all leases for /pods endpoint
   async listLeaseStates(): Promise<PodLeaseState[]> {
     const states: PodLeaseState[] = [];
-    for (const podName of POD_NAMES) {
+    for (const podName of this.podNames) {
       try {
-        const lease = await this.coordApi.readNamespacedLease({ name: podName, namespace: this.namespace });
-        const spec = lease.spec ?? {};
-        const isLeased = !!spec.holderIdentity && !this.isExpired(spec);
-        states.push({
-          name: podName,
-          lease: isLeased
-            ? {
-                status: "leased",
-                holderIdentity: spec.holderIdentity!,
-                expiresAt: this.expiresAt(spec),
-              }
-            : { status: "free" },
-        });
+        const holder = await this.lockClient.get(POD_LOCK_KEY(podName));
+        if (holder) {
+          const ttlMs = await this.lockClient.pttl(POD_LOCK_KEY(podName));
+          const expiresAt = new Date(Date.now() + Math.max(0, ttlMs)).toISOString();
+          states.push({ name: podName, lease: { status: "leased", holderIdentity: holder, expiresAt } });
+        } else {
+          states.push({ name: podName, lease: { status: "free" } });
+        }
       } catch {
         states.push({ name: podName, lease: { status: "unknown" } });
       }
@@ -151,102 +154,6 @@ export class LeaseManager {
     return states;
   }
 
-  private async tryAcquireAny(context: LeaseContext): Promise<string | null> {
-    for (const podName of POD_NAMES) {
-      // inMemoryHeld prevents in-process races — Node.js is single-threaded so
-      // has+add here is atomic. K8s lease is the authoritative lock for multi-replica safety.
-      if (this.inMemoryHeld.has(podName)) continue;
-      this.inMemoryHeld.add(podName);
-
-      const acquired = await this.tryAcquireLease(podName, context);
-      if (acquired) return podName;
-      // K8s rejected it (another worker replica holds it) — free the reservation
-      this.inMemoryHeld.delete(podName);
-    }
-    return null;
-  }
-
-  private async tryAcquireLease(podName: string, context: LeaseContext): Promise<boolean> {
-    try {
-      const lease = await this.coordApi.readNamespacedLease({ name: podName, namespace: this.namespace });
-      const spec = lease.spec ?? {};
-
-      // Pod is busy if holder exists and lease hasn't expired
-      if (spec.holderIdentity && !this.isExpired(spec)) return false;
-
-      if (spec.holderIdentity) {
-        logger.info({ pod: podName, expiredHolder: spec.holderIdentity }, "sandbox.lease.expired-recovery");
-      }
-
-      await this.acquireLease(podName, context, lease.metadata?.resourceVersion);
-      return true;
-    } catch (err: unknown) {
-      const e = err as { statusCode?: number; body?: { code?: number }; message?: string };
-      const code = e.statusCode ?? e.body?.code;
-      if (code === 409) {
-        logger.debug({ pod: podName, ...context }, "sandbox.lease.conflict");
-      } else {
-        logger.error({ pod: podName, code, error: e.message }, "sandbox.lease.acquire-error");
-      }
-      return false;
-    }
-  }
-
-  private async acquireLease(podName: string, context: LeaseContext, resourceVersion?: string): Promise<void> {
-    const holderIdentity = `${context.instanceId}:${context.requestId}:${context.sessionId}:${context.toolCallId}`;
-    const now = microTime();
-
-    await this.coordApi.replaceNamespacedLease({
-      name: podName,
-      namespace: this.namespace,
-      body: {
-        apiVersion: "coordination.k8s.io/v1",
-        kind: "Lease",
-        metadata: {
-          name: podName,
-          namespace: this.namespace,
-          resourceVersion,
-        },
-        spec: {
-          holderIdentity,
-          leaseDurationSeconds: this.leaseTtlSeconds,
-          renewTime: now as unknown as Date,
-          acquireTime: now as unknown as Date,
-        },
-      },
-    });
-
-    logger.info({ pod: podName, holderIdentity, leaseDurationSeconds: this.leaseTtlSeconds }, "sandbox.lease.acquired");
-  }
-
-  private async clearLease(podName: string): Promise<void> {
-    try {
-      const lease = await this.coordApi.readNamespacedLease({ name: podName, namespace: this.namespace });
-      await this.coordApi.replaceNamespacedLease({
-        name: podName,
-        namespace: this.namespace,
-        body: {
-          apiVersion: "coordination.k8s.io/v1",
-          kind: "Lease",
-          metadata: {
-            name: podName,
-            namespace: this.namespace,
-            resourceVersion: lease.metadata?.resourceVersion,
-          },
-          spec: {
-            holderIdentity: "",
-            leaseDurationSeconds: this.leaseTtlSeconds,
-            renewTime: microTime() as unknown as Date,
-          },
-        },
-      });
-    } catch (err) {
-      logger.warn({ pod: podName, err }, "sandbox.lease.release-failed (non-fatal)");
-    }
-  }
-
-  // Annotate the pod with the current tool call id for kubectl observability:
-  // kubectl get pods -n sendai -o jsonpath='{.items[*].metadata.annotations}'
   async annotatePod(podName: string, toolCallId: string): Promise<void> {
     try {
       await this.coreApi.patchNamespacedPod({
@@ -261,8 +168,8 @@ export class LeaseManager {
           },
         },
       });
-    } catch (err) {
-      logger.warn({ pod: podName, err }, "sandbox.annotate.failed (non-fatal)");
+    } catch {
+      // non-fatal
     }
   }
 
@@ -285,68 +192,73 @@ export class LeaseManager {
     }
   }
 
-  // Watchdog: scan for leases past their TTL and forcibly release them
-  private startWatchdog() {
-    this.watchdogInterval = setInterval(async () => {
-      for (const podName of POD_NAMES) {
-        try {
-          const lease = await this.coordApi.readNamespacedLease({ name: podName, namespace: this.namespace });
-          const spec = lease.spec ?? {};
-          if (spec.holderIdentity && this.isExpired(spec)) {
-            logger.warn({ pod: podName, holder: spec.holderIdentity }, "sandbox.watchdog.zombie-detected");
-            await this.clearLease(podName);
-            await this.clearAnnotations(podName);
-            this.inMemoryHeld.delete(podName);
-            logger.info({ pod: podName }, "sandbox.watchdog.zombie-cleared");
-            const waiter = this.waiters.shift();
-            if (waiter) {
-              const waitMs = Date.now() - waiter.enqueueTime;
-              try {
-                await this.acquireLease(podName, waiter.context);
-                this.inMemoryHeld.add(podName);
-                waiter.resolve(podName, 1, waitMs);
-              } catch {
-                this.waiters.unshift(waiter);
-              }
-            }
-          }
-        } catch {
-          // ignore per-pod errors
-        }
-      }
-    }, 15_000); // check every 15s
-    this.watchdogInterval.unref();
-  }
-
   stopWatchdog() {
     if (this.watchdogInterval) clearInterval(this.watchdogInterval);
+    if (this.discoveryInterval) clearInterval(this.discoveryInterval);
   }
 
-  private isExpired(spec: k8s.V1LeaseSpec): boolean {
-    if (!spec.renewTime || !spec.leaseDurationSeconds) return true;
-    const renewedAt = new Date(spec.renewTime as unknown as string).getTime();
-    return Date.now() > renewedAt + spec.leaseDurationSeconds * 1000;
+  private async tryAcquireAny(context: LeaseContext): Promise<string | null> {
+    for (const podName of this.podNames) {
+      if (await this.tryAcquirePod(podName, context)) return podName;
+    }
+    return null;
   }
 
-  private expiresAt(spec: k8s.V1LeaseSpec): string {
-    if (!spec.renewTime || !spec.leaseDurationSeconds) return "unknown";
-    const renewedAt = new Date(spec.renewTime as unknown as string).getTime();
-    return new Date(renewedAt + spec.leaseDurationSeconds * 1000).toISOString();
+  private async tryAcquirePod(podName: string, context: LeaseContext): Promise<boolean> {
+    const holder = `${context.instanceId}:${context.toolCallId}`;
+    const res = await this.lockClient.set(
+      POD_LOCK_KEY(podName),
+      holder,
+      "PX",
+      this.leaseTtlMs,
+      "NX",
+    );
+    if (res === "OK") {
+      logger.info({ pod: podName, holder, ttlMs: this.leaseTtlMs }, "sandbox.lock.acquired");
+      return true;
+    }
+    return false;
   }
-}
 
-export interface PodLeaseState {
-  name: string;
-  lease:
-    | { status: "free" }
-    | { status: "leased"; holderIdentity: string; expiresAt: string }
-    | { status: "unknown" };
-}
+  private startPodDiscovery() {
+    const discover = async () => {
+      try {
+        const res = await this.coreApi.listNamespacedPod({
+          namespace: this.namespace,
+          labelSelector: "app=sandbox-runner",
+          fieldSelector: "status.phase=Running",
+        });
+        const names = (res.items ?? [])
+          .map((p) => p.metadata?.name ?? "")
+          .filter(Boolean)
+          .sort();
+        if (names.length > 0) {
+          this.podNames = names;
+          logger.debug({ pods: names }, "sandbox.pod.discovery.updated");
+        }
+      } catch (err) {
+        logger.warn({ err }, "sandbox.pod.discovery.failed — retaining last known list");
+      }
+    };
 
-export class QueueTimeoutError extends Error {
-  readonly code = "sandbox_capacity_timeout";
-  constructor() {
-    super("No sandbox pod became available within 15 seconds.");
-    this.name = "QueueTimeoutError";
+    discover();
+    this.discoveryInterval = setInterval(discover, config.POD_DISCOVERY_INTERVAL_MS);
+    this.discoveryInterval.unref();
+  }
+
+  // Periodically try to assign waiting requests to any pods freed by TTL expiry
+  private startWatchdog() {
+    this.watchdogInterval = setInterval(async () => {
+      if (this.waiters.length === 0) return;
+      const waiter = this.waiters[0];
+      const pod = await this.tryAcquireAny(waiter.context);
+      if (pod) {
+        this.waiters.shift();
+        const waitMs = Date.now() - waiter.enqueueTime;
+        logger.info({ pod, waitMs }, "sandbox.watchdog.assigned-waiter");
+        waiter.resolve(pod, 1, waitMs);
+      }
+    }, 5_000);
+    this.watchdogInterval.unref();
   }
 }

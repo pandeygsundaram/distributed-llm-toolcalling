@@ -14,6 +14,7 @@ export const TOOL_NAMES = {
   FS_READ: "fs_read",
   FS_WRITE: "fs_write",
   ENV_INSPECT: "env_inspect",
+  MATH_COMPUTE: "math_compute",
 } as const;
 
 export type ToolName = (typeof TOOL_NAMES)[keyof typeof TOOL_NAMES];

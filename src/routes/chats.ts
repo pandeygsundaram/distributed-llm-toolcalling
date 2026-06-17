@@ -4,20 +4,18 @@ import { chatStore } from "../history/chat-store.js";
 export function registerChatHistoryRoutes(): Router {
   const router = Router();
 
-  // List all sessions
-  router.get("/chats", (_req, res) => {
-    res.json({ sessions: chatStore.getSessions() });
+  router.get("/chats", async (_req, res) => {
+    const sessions = await chatStore.getSessions();
+    res.json({ sessions });
   });
 
-  // Full conversation for a session
-  router.get("/chats/:sessionId", (req, res) => {
-    const messages = chatStore.getMessages(req.params.sessionId);
+  router.get("/chats/:sessionId", async (req, res) => {
+    const messages = await chatStore.getMessages(req.params.sessionId);
     res.json({ sessionId: req.params.sessionId, messages });
   });
 
-  // Delete a session
-  router.delete("/chats/:sessionId", (req, res) => {
-    chatStore.deleteSession(req.params.sessionId);
+  router.delete("/chats/:sessionId", async (req, res) => {
+    await chatStore.deleteSession(req.params.sessionId);
     res.json({ ok: true });
   });
 

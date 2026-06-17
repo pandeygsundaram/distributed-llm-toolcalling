@@ -2,6 +2,7 @@ import http from "http";
 import express from "express";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+import { initDb } from "./history/db.js";
 import { LocalExecutor } from "./executor/local.js";
 import { RedisExecutor } from "./executor/redis.js";
 import { PiClient } from "./pi/client.js";
@@ -18,17 +19,19 @@ import { registerChatHistoryRoutes } from "./routes/chats.js";
 import { registerApprovalRoutes } from "./routes/approve.js";
 
 async function main() {
+  await initDb();
+
   const useRedis = config.USE_REDIS === "true";
 
   let executor: LocalExecutor | RedisExecutor;
   let leaseManager: LeaseManager | null = null;
 
   if (useRedis) {
-    logger.info("executor: redis (phase 2)");
+    logger.info("executor: redis (scalable mode)");
     executor = new RedisExecutor();
     leaseManager = new LeaseManager();
   } else {
-    logger.info("executor: local (phase 1)");
+    logger.info("executor: local (dev mode)");
     executor = new LocalExecutor();
     await (executor as LocalExecutor).init();
   }
@@ -40,9 +43,14 @@ async function main() {
   app.use((_req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     if (_req.method === "OPTIONS") { res.sendStatus(204); return; }
     next();
+  });
+
+  // SSE stream — replaces WebSocket
+  app.get("/events", (req, res) => {
+    broadcaster.attachClient(res);
   });
 
   app.use(registerHealthRoutes(leaseManager));
@@ -60,15 +68,15 @@ async function main() {
   });
 
   const server = http.createServer(app);
-  broadcaster.attach(server);
 
-  // Broadcast pod + metrics state every 2s to connected WebSocket clients
+  // Broadcast pod + metrics state every 2s to connected SSE clients
   setInterval(async () => {
     if (broadcaster.clientCount() === 0) return;
     if (leaseManager) {
       const pods = await leaseManager.listLeaseStates().catch(() => []);
-      const inUse = pods.filter(p => p.lease.status === "leased").length;
+      const inUse = pods.filter((p) => p.lease.status === "leased").length;
       metrics.setPodsInUse(inUse);
+      metrics.setQueueDepth(leaseManager.queueDepth);
       broadcaster.broadcast({ type: "pods_update", data: { pods } });
     }
     broadcaster.broadcast({ type: "metrics_update", data: metrics.snapshot() });

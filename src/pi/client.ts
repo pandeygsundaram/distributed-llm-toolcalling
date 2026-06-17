@@ -16,6 +16,7 @@ Examples:
 - **shell_run** — run a shell command in the pod. Allowed: pwd, ls, cat, whoami, node.
 - **fs_read** — read a file from the pod by path.
 - **fs_write** — write content to a file in the pod. ALWAYS requires human approval — the user will see a preview modal and must approve before the write happens. If rejected, do not retry without asking the user.
+- **math_compute** — run a math operation inside the pod (add, subtract, multiply, divide, modulo, power, sqrt, factorial, fibonacci, is_prime, gcd). The computation executes in the pod via Node.js. Use this for any arithmetic the user asks for.
 - **env_inspect** — get hostname, pod name, namespace, user, working directory.
 
 ## After a tool call
@@ -70,12 +71,26 @@ export interface ChatResult {
 export interface ToolCallSummary {
   toolCallId: string;
   tool: string;
+  input: Record<string, unknown>;
+  output: string;
   status: "completed" | "failed";
   executedIn: "local" | "pod";
   pod?: string;
   durationMs: number;
   queuePosition?: number;
   queueWaitMs?: number;
+}
+
+function recordToolCall(
+  summaries: ToolCallSummary[],
+  summary: ToolCallSummary,
+  ctx: { sessionId: string; requestId: string }
+) {
+  summaries.push(summary);
+  broadcaster.broadcast({
+    type: "tool_call_update",
+    data: { ...summary, sessionId: ctx.sessionId, requestId: ctx.requestId },
+  });
 }
 
 // Thread request context into tool execute() via AsyncLocalStorage
@@ -200,16 +215,18 @@ export class PiClient {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
         });
-        toolCallSummaries.push({
+        recordToolCall(toolCallSummaries, {
           toolCallId,
           tool: "shell_run",
+          input: params as Record<string, unknown>,
+          output: result.output,
           status: result.status,
           executedIn: result.executedIn,
           pod: result.pod,
           durationMs: result.durationMs,
           queuePosition: result.queuePosition,
           queueWaitMs: result.queueWaitMs,
-        });
+        }, ctx);
         return {
           content: [{ type: "text" as const, text: result.output }],
           details: { pod: result.pod, durationMs: result.durationMs },
@@ -233,16 +250,18 @@ export class PiClient {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
         });
-        toolCallSummaries.push({
+        recordToolCall(toolCallSummaries, {
           toolCallId,
           tool: "fs_read",
+          input: params as Record<string, unknown>,
+          output: result.output,
           status: result.status,
           executedIn: result.executedIn,
           pod: result.pod,
           durationMs: result.durationMs,
           queuePosition: result.queuePosition,
           queueWaitMs: result.queueWaitMs,
-        });
+        }, ctx);
         return {
           content: [{ type: "text" as const, text: result.output }],
           details: { pod: result.pod, durationMs: result.durationMs },
@@ -274,15 +293,19 @@ export class PiClient {
         const approved = await approvalManager.waitForResponse(approval.approvalId, 60_000);
 
         if (!approved) {
-          toolCallSummaries.push({
+          const rejMsg = "Write rejected by user. Do not retry without asking.";
+          recordToolCall(toolCallSummaries, {
             toolCallId,
             tool: "fs_write",
+            input: params as Record<string, unknown>,
+            output: rejMsg,
             status: "failed",
             executedIn: "pod",
             durationMs: 0,
-          });
+          }, ctx);
           return {
-            content: [{ type: "text" as const, text: "Write rejected by user. Do not retry without asking." }],
+            content: [{ type: "text" as const, text: rejMsg }],
+            details: { pod: undefined, durationMs: 0 },
           };
         }
 
@@ -294,17 +317,68 @@ export class PiClient {
           sessionId: ctx.sessionId,
         });
 
-        toolCallSummaries.push({
+        recordToolCall(toolCallSummaries, {
           toolCallId,
           tool: "fs_write",
+          input: params as Record<string, unknown>,
+          output: result.output || `Written to ${params.filePath}`,
           status: result.status,
           executedIn: result.executedIn,
           pod: result.pod,
           durationMs: result.durationMs,
-        });
+        }, ctx);
 
         return {
           content: [{ type: "text" as const, text: result.output || `Written to ${params.filePath}` }],
+          details: { pod: result.pod, durationMs: result.durationMs },
+        };
+      },
+    });
+
+    const mathComputeTool = defineTool({
+      name: "math_compute",
+      label: "Math Compute (runs in pod)",
+      description: "Execute a math operation inside the pod using Node.js. Supports: add, subtract, multiply, divide, modulo, power, sqrt, factorial, fibonacci, is_prime, gcd. Large results (factorial, fibonacci) use BigInt and return exact integers.",
+      parameters: Type.Object({
+        operation: Type.Union([
+          Type.Literal("add"),
+          Type.Literal("subtract"),
+          Type.Literal("multiply"),
+          Type.Literal("divide"),
+          Type.Literal("modulo"),
+          Type.Literal("power"),
+          Type.Literal("sqrt"),
+          Type.Literal("factorial"),
+          Type.Literal("fibonacci"),
+          Type.Literal("is_prime"),
+          Type.Literal("gcd"),
+        ], { description: "The math operation to perform" }),
+        a: Type.Optional(Type.Number({ description: "First operand (or the sole operand for unary ops like sqrt, factorial, fibonacci, is_prime)" })),
+        b: Type.Optional(Type.Number({ description: "Second operand (required for binary ops: add, subtract, multiply, divide, modulo, power, gcd)" })),
+      }),
+      execute: async (toolCallId, params) => {
+        const ctx = requestCtx.getStore()!;
+        const result = await executor.execute({
+          toolCallId,
+          tool: "math_compute",
+          input: params as Record<string, unknown>,
+          requestId: ctx.requestId,
+          sessionId: ctx.sessionId,
+        });
+        recordToolCall(toolCallSummaries, {
+          toolCallId,
+          tool: "math_compute",
+          input: params as Record<string, unknown>,
+          output: result.output,
+          status: result.status,
+          executedIn: result.executedIn,
+          pod: result.pod,
+          durationMs: result.durationMs,
+          queuePosition: result.queuePosition,
+          queueWaitMs: result.queueWaitMs,
+        }, ctx);
+        return {
+          content: [{ type: "text" as const, text: result.output }],
           details: { pod: result.pod, durationMs: result.durationMs },
         };
       },
@@ -324,16 +398,18 @@ export class PiClient {
           requestId: ctx.requestId,
           sessionId: ctx.sessionId,
         });
-        toolCallSummaries.push({
+        recordToolCall(toolCallSummaries, {
           toolCallId,
           tool: "env_inspect",
+          input: {},
+          output: result.output,
           status: result.status,
           executedIn: result.executedIn,
           pod: result.pod,
           durationMs: result.durationMs,
           queuePosition: result.queuePosition,
           queueWaitMs: result.queueWaitMs,
-        });
+        }, ctx);
         return {
           content: [{ type: "text" as const, text: result.output }],
           details: { pod: result.pod, durationMs: result.durationMs },
@@ -361,7 +437,7 @@ export class PiClient {
       sessionManager: SessionManager.inMemory(),
       settingsManager,
       noTools: "builtin",
-      customTools: [shellRunTool, fsReadTool, fsWriteTool, envInspectTool],
+      customTools: [shellRunTool, fsReadTool, fsWriteTool, mathComputeTool, envInspectTool],
       resourceLoader,
     });
 

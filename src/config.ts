@@ -9,12 +9,22 @@ const schema = z.object({
   LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error"]).default("info"),
   USE_REDIS: z.string().optional(),
 
-  // Phase 2
+  // Redis
   REDIS_URL: z.string().default("redis://localhost:6379"),
+  REDIS_SENTINEL_URLS: z.string().optional(), // comma-separated sentinel host:port pairs
+
+  // Postgres (replaces SQLite)
+  DATABASE_URL: z.string().default("postgres://postgres:postgres@localhost:5432/sendai"),
+
+  // Kubernetes
   K8S_NAMESPACE: z.string().default("sendai"),
   QUEUE_MAX_WAIT_MS: z.coerce.number().default(15_000),
   TOOL_TIMEOUT_MS: z.coerce.number().default(30_000),
-  LEASE_TTL_SECONDS: z.coerce.number().default(45),
+  LEASE_TTL_SECONDS: z.coerce.number().default(30),      // Redis lock TTL (30s — lower than old K8s Lease 45s)
+  POD_DISCOVERY_INTERVAL_MS: z.coerce.number().default(10_000),  // re-discover pods every 10s
+
+  // Per-session concurrency
+  MAX_SESSION_INFLIGHT: z.coerce.number().default(3),
 });
 
 const result = schema.safeParse(process.env);

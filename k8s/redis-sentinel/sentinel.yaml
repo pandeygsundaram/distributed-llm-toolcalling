@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+  namespace: sendai
+data:
+  sentinel.conf: |
+    sentinel monitor mymaster redis-primary 6379 2
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 30000
+    sentinel parallel-syncs mymaster 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-sentinel
+  namespace: sendai
+spec:
+  replicas: 3   # odd number — majority vote required for failover
+  selector:
+    matchLabels:
+      app: redis-sentinel
+  template:
+    metadata:
+      labels:
+        app: redis-sentinel
+    spec:
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          command:
+            - redis-sentinel
+            - /etc/sentinel/sentinel.conf
+          ports:
+            - containerPort: 26379
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sentinel
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: sentinel-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: sendai
+spec:
+  selector:
+    app: redis-sentinel
+  ports:
+    - port: 26379
+      targetPort: 26379

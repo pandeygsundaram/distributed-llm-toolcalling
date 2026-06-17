@@ -44,6 +44,15 @@ export class PodExecutor {
     return result;
   }
 
+  // Wipe sandbox files between leases so tenants don't see each other's data
+  async cleanup(podName: string): Promise<void> {
+    await this.execInPod(podName, [
+      "sh", "-c",
+      `rm -rf ${SANDBOX_DIR}/* ${SANDBOX_DIR}/.[!.]* 2>/dev/null; true`,
+    ]);
+    logger.info({ pod: podName }, "sandbox.cleanup.done");
+  }
+
   private buildCommand(tool: string, input: Record<string, unknown>): string[] {
     switch (tool) {
       case TOOL_NAMES.SHELL_RUN: {
@@ -76,6 +85,56 @@ export class PodExecutor {
           `printf '{"hostname":"%s","user":"%s","workingDirectory":"${SANDBOX_DIR}","podName":"%s","namespace":"%s"}' ` +
           `"$(hostname)" "$(whoami)" "$POD_NAME" "$POD_NAMESPACE"`
         ];
+      }
+
+      case TOOL_NAMES.MATH_COMPUTE: {
+        const op = input.operation as string;
+        const a = Number(input.a ?? 0);
+        const b = Number(input.b ?? 0);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) throw new Error("Invalid numeric input");
+
+        let script: string;
+        switch (op) {
+          case "add":      script = `console.log(${a} + ${b})`; break;
+          case "subtract": script = `console.log(${a} - ${b})`; break;
+          case "multiply": script = `console.log(${a} * ${b})`; break;
+          case "divide":
+            if (b === 0) throw new Error("division by zero");
+            script = `console.log(${a} / ${b})`;
+            break;
+          case "modulo":
+            if (b === 0) throw new Error("modulo by zero");
+            script = `console.log(${a} % ${b})`;
+            break;
+          case "power":    script = `console.log(Math.pow(${a}, ${b}))`; break;
+          case "sqrt":     script = `console.log(Math.sqrt(${a}))`; break;
+          case "factorial": {
+            const n = Math.floor(a);
+            if (n < 0 || n > 1000) throw new Error("factorial: n must be 0–1000");
+            script = `let f=1n;for(let i=2n;i<=${n}n;i++)f*=i;console.log(f.toString())`;
+            break;
+          }
+          case "fibonacci": {
+            const n = Math.floor(a);
+            if (n < 0 || n > 10_000) throw new Error("fibonacci: n must be 0–10000");
+            script = `let x=0n,y=1n;for(let i=0;i<${n};i++){let t=x+y;x=y;y=t;}console.log(x.toString())`;
+            break;
+          }
+          case "is_prime": {
+            const n = Math.floor(a);
+            script = `const n=${n};if(n<2){console.log('false')}else{let p=true;for(let i=2;i<=Math.sqrt(n);i++){if(n%i===0){p=false;break}}console.log(String(p))}`;
+            break;
+          }
+          case "gcd": {
+            const x = Math.abs(Math.floor(a)), y = Math.abs(Math.floor(b));
+            script = `let x=${x},y=${y};while(y){let t=y;y=x%y;x=t;}console.log(x)`;
+            break;
+          }
+          default:
+            throw new Error(`Unknown math operation: ${op}`);
+        }
+
+        return ["node", "-e", script];
       }
 
       default:

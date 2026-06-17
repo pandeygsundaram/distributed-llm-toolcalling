@@ -1,41 +1,45 @@
-import { WebSocketServer, WebSocket } from "ws";
-import type { Server } from "http";
+import type { Response } from "express";
 import { logger } from "../logger.js";
 
-type WSEvent =
+type SSEEvent =
   | { type: "pods_update"; data: unknown }
   | { type: "execution_update"; data: unknown }
+  | { type: "tool_call_update"; data: unknown }
   | { type: "metrics_update"; data: unknown }
   | { type: "queue_update"; data: { depth: number; waiters: number } }
   | { type: "permission_request"; data: unknown };
 
 class Broadcaster {
-  private clients = new Set<WebSocket>();
-  private wss: WebSocketServer | null = null;
+  private clients = new Set<Response>();
 
-  attach(server: Server) {
-    this.wss = new WebSocketServer({ server, path: "/ws" });
+  // Called from GET /events — keeps the response open as an SSE stream
+  attachClient(res: Response) {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+    res.flushHeaders();
 
-    this.wss.on("connection", (ws) => {
-      this.clients.add(ws);
-      logger.debug({ total: this.clients.size }, "ws.client.connected");
+    this.clients.add(res);
+    logger.debug({ total: this.clients.size }, "sse.client.connected");
 
-      ws.on("close", () => {
-        this.clients.delete(ws);
-        logger.debug({ total: this.clients.size }, "ws.client.disconnected");
-      });
+    // Keep-alive comment every 25s to prevent proxy timeouts
+    const ping = setInterval(() => {
+      if (!res.writableEnded) res.write(": ping\n\n");
+    }, 25_000);
 
-      ws.on("error", () => this.clients.delete(ws));
+    res.on("close", () => {
+      this.clients.delete(res);
+      clearInterval(ping);
+      logger.debug({ total: this.clients.size }, "sse.client.disconnected");
     });
-
-    logger.info("ws.broadcaster.ready");
   }
 
-  broadcast(event: WSEvent) {
-    const payload = JSON.stringify(event);
+  broadcast(event: SSEEvent) {
+    const payload = `data: ${JSON.stringify(event)}\n\n`;
     for (const client of this.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
+      if (!client.writableEnded) {
+        client.write(payload);
       }
     }
   }
