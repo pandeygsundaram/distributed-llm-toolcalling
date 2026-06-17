@@ -217,12 +217,16 @@ export function ChatPage({ sessionId, onMessageSent }: Props) {
       .then((r) => r.json())
       .then((d) => {
         const msgs: ChatMessage[] = (d.messages ?? []).map((m: {
-          id: string; role: string; content: string; toolCalls?: string;
+          id: string; role: string; content: string; toolCalls?: ToolCall[] | string;
         }) => ({
           id: m.id,
           role: m.role as "user" | "assistant",
           content: m.content,
-          toolCalls: m.toolCalls ? JSON.parse(m.toolCalls) : undefined,
+          toolCalls: Array.isArray(m.toolCalls)
+            ? m.toolCalls
+            : m.toolCalls
+            ? JSON.parse(m.toolCalls)
+            : undefined,
         }));
         setMessages(msgs);
       })
@@ -233,13 +237,13 @@ export function ChatPage({ sessionId, onMessageSent }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const handleWsEvent = useCallback((ev: ReturnType<typeof useWebSocket> extends (fn: (ev: infer E) => void) => void ? E : never) => {
+  const handleWsEvent = useCallback((ev: Parameters<Parameters<typeof useWebSocket>[0]>[0]) => {
     if (ev.type === "pods_update") setPods(ev.data.pods);
     if (ev.type === "metrics_update") setMetrics(ev.data);
     if (ev.type === "execution_update") setExecutions((p) => [ev.data, ...p].slice(0, 100));
   }, []);
 
-  useWebSocket(handleWsEvent as Parameters<typeof useWebSocket>[0]);
+  useWebSocket(handleWsEvent);
 
   async function send() {
     const text = input.trim();
@@ -260,6 +264,17 @@ export function ChatPage({ sessionId, onMessageSent }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionId, message: text }),
       });
+
+      if (res.status === 429) {
+        setMessages((p) =>
+          p.map((m) => m.id === loadingId
+            ? { ...m, content: "Too many concurrent requests — all pods are busy. Please wait a moment and try again.", loading: false }
+            : m
+          )
+        );
+        return;
+      }
+
       const data = await res.json();
       activeRequestRef.current = data.requestId;
       setMessages((p) =>

@@ -7,6 +7,7 @@ export function PodsPage() {
   const [pods, setPods] = useState<PodState[]>([]);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [executions, setExecutions] = useState<ExecutionRecord[]>([]);
+  const [queueWaiters, setQueueWaiters] = useState(0);
 
   // Initial fetch so pods show immediately without waiting for first WS tick
   useEffect(() => {
@@ -17,6 +18,7 @@ export function PodsPage() {
     if (ev.type === "pods_update") setPods(ev.data.pods);
     if (ev.type === "metrics_update") setMetrics(ev.data);
     if (ev.type === "execution_update") setExecutions((p) => [ev.data, ...p].slice(0, 50));
+    if (ev.type === "queue_update") setQueueWaiters(ev.data.waiters);
   }, []);
 
   useWebSocket(handleEvent);
@@ -31,6 +33,13 @@ export function PodsPage() {
         <div className="flex gap-4 mt-2 text-xs text-slate-500">
           <span><span className="text-emerald-400 font-mono">{freePods}</span> idle</span>
           <span><span className="text-amber-400 font-mono">{busyPods}</span> active</span>
+          {queueWaiters > 0 && (
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-orange-400 animate-pulse" />
+              <span className="text-orange-400 font-mono">{queueWaiters}</span>
+              <span>waiting</span>
+            </span>
+          )}
           {metrics && <span><span className="text-slate-300 font-mono">{Object.values(metrics.tools).reduce((s, t) => s + t.count, 0)}</span> total execs</span>}
         </div>
       </div>

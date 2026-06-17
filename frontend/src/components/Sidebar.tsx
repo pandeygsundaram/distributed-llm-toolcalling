@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import {
   MessageSquare, Activity, ChevronLeft, ChevronRight,
-  Plus, Trash2, LayoutGrid,
+  Plus, Trash2, LayoutGrid, AlertTriangle,
 } from "lucide-react";
 import { cn, formatTime } from "../lib/utils";
 
@@ -25,11 +25,13 @@ const NAV_ITEMS = [
   { label: "Chat", icon: MessageSquare, path: "/" },
   { label: "Pods", icon: LayoutGrid, path: "/pods" },
   { label: "Traces", icon: Activity, path: "/traces" },
+  { label: "DLQ", icon: AlertTriangle, path: "/dlq" },
 ];
 
 export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshTrigger }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [dlqCount, setDlqCount] = useState(0);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -39,6 +41,15 @@ export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshT
       .then((d) => setSessions(d.sessions ?? []))
       .catch(() => {});
   }, [refreshTrigger, currentSessionId]);
+
+  useEffect(() => {
+    function loadDlq() {
+      fetch("/dlq").then(r => r.json()).then(d => setDlqCount(d.count ?? 0)).catch(() => {});
+    }
+    loadDlq();
+    const id = setInterval(loadDlq, 15_000);
+    return () => clearInterval(id);
+  }, []);
 
   async function deleteSession(e: React.MouseEvent, id: string) {
     e.stopPropagation();
@@ -88,6 +99,8 @@ export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshT
       <nav className={cn("px-2 py-2 space-y-0.5 border-b border-[#2a2a2a]", collapsed && "px-1")}>
         {NAV_ITEMS.map(({ label, icon: Icon, path }) => {
           const active = location.pathname === path || (path !== "/" && location.pathname.startsWith(path));
+          const isDlq = path === "/dlq";
+          const showBadge = isDlq && dlqCount > 0;
           return (
             <button
               key={path}
@@ -95,14 +108,25 @@ export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshT
               className={cn(
                 "w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors",
                 active
-                  ? "bg-violet-600/20 text-violet-300"
+                  ? isDlq ? "bg-red-900/20 text-red-300" : "bg-violet-600/20 text-violet-300"
                   : "text-slate-400 hover:bg-[#222] hover:text-white",
                 collapsed && "justify-center px-0"
               )}
               title={collapsed ? label : undefined}
             >
-              <Icon size={15} className="shrink-0" />
-              {!collapsed && <span>{label}</span>}
+              <Icon size={15} className={cn("shrink-0", isDlq && dlqCount > 0 && "text-red-400")} />
+              {!collapsed && <span className="flex-1 text-left">{label}</span>}
+              {showBadge && (
+                <span className={cn(
+                  "text-[9px] font-mono font-bold px-1.5 py-0.5 rounded-full bg-red-800/60 text-red-300",
+                  collapsed && "hidden"
+                )}>
+                  {dlqCount > 99 ? "99+" : dlqCount}
+                </span>
+              )}
+              {showBadge && collapsed && (
+                <span className="absolute right-1 top-1 w-1.5 h-1.5 rounded-full bg-red-500" />
+              )}
             </button>
           );
         })}
@@ -123,7 +147,7 @@ export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshT
                   onSelectSession(s.sessionId);
                   if (location.pathname.startsWith("/traces")) {
                     navigate(`/traces/${s.sessionId}`);
-                  } else {
+                  } else if (location.pathname !== "/") {
                     navigate("/");
                   }
                 }}

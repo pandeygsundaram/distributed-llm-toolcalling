@@ -5,6 +5,7 @@ import { ChatPage } from "./pages/ChatPage";
 import { PodsPage } from "./pages/PodsPage";
 import { TracesPage } from "./pages/TracesPage";
 import { TraceDetailPage } from "./pages/TraceDetailPage";
+import { DLQPage } from "./pages/DLQPage";
 import { ApprovalModal, type ApprovalRequest } from "./components/ApprovalModal";
 import { useWebSocket } from "./hooks/useWebSocket";
 
@@ -70,6 +71,7 @@ export default function App() {
           <Route path="/pods" element={<PodsPage />} />
           <Route path="/traces" element={<TracesPage />} />
           <Route path="/traces/:id" element={<TraceDetailPage />} />
+          <Route path="/dlq" element={<DLQPage />} />
         </Routes>
       </main>
 

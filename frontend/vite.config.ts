@@ -13,7 +13,9 @@ export default defineConfig({
       '/cancel': 'http://localhost:3000',
       '/chats': 'http://localhost:3000',
       '/approve': 'http://localhost:3000',
-      '/ws': { target: 'ws://localhost:3000', ws: true },
+      '/events': 'http://localhost:3000',
+      '/dlq': 'http://localhost:3000',
+      '/metrics': 'http://localhost:3000',
     },
   },
 })
