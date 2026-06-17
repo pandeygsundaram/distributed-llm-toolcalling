@@ -119,7 +119,14 @@ export function Sidebar({ currentSessionId, onNewChat, onSelectSession, refreshT
             {sessions.map((s) => (
               <div
                 key={s.sessionId}
-                onClick={() => { onSelectSession(s.sessionId); navigate("/"); }}
+                onClick={() => {
+                  onSelectSession(s.sessionId);
+                  if (location.pathname.startsWith("/traces")) {
+                    navigate(`/traces/${s.sessionId}`);
+                  } else {
+                    navigate("/");
+                  }
+                }}
                 className={cn(
                   "group relative flex flex-col rounded-md px-2 py-1.5 cursor-pointer transition-colors",
                   s.sessionId === currentSessionId

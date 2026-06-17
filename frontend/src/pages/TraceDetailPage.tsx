@@ -1,69 +1,396 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
-  ArrowLeft, CheckCircle2, XCircle, Clock, Server,
-  Terminal, Cpu, Hash, Calendar,
+  User, Bot, Terminal, CheckCircle2, XCircle,
+  Clock, Server, Hash, Layers, ArrowLeft, Zap,
 } from "lucide-react";
 import { cn, formatTime, formatMs } from "../lib/utils";
+import { useWebSocket, type ToolCallLiveEvent } from "../hooks/useWebSocket";
 
-interface ExecutionRecord {
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ChatMessage {
   id: string;
-  requestId: string;
   sessionId: string;
+  role: "user" | "assistant";
+  content: string;
+  toolCalls?: string;
+  createdAt: string;
+}
+
+interface ParsedToolCall {
   toolCallId: string;
   tool: string;
   input: Record<string, unknown>;
   output: string;
-  pod: string;
   status: "completed" | "failed";
+  executedIn?: string;
+  pod?: string;
   durationMs: number;
-  startedAt: string;
-  finishedAt: string;
+  queuePosition?: number;
+  queueWaitMs?: number;
 }
 
-interface TimelineStep {
-  label: string;
-  ts: string;
-  durationMs?: number;
-  status: "done" | "error" | "info";
+type TraceItem =
+  | { kind: "user";      id: string; content: string; createdAt: string; turnIndex: number }
+  | { kind: "tool_call"; id: string; tc: ParsedToolCall; live?: boolean; turnIndex: number }
+  | { kind: "assistant"; id: string; content: string; createdAt: string; toolCount: number; totalToolMs: number; turnIndex: number };
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const TOOL_COLORS: Record<string, { bg: string; text: string; bar: string }> = {
+  shell_run:    { bg: "bg-blue-900/30",    text: "text-blue-300",    bar: "bg-blue-500" },
+  fs_read:      { bg: "bg-amber-900/30",   text: "text-amber-300",   bar: "bg-amber-500" },
+  fs_write:     { bg: "bg-orange-900/30",  text: "text-orange-300",  bar: "bg-orange-500" },
+  env_inspect:  { bg: "bg-purple-900/30",  text: "text-purple-300",  bar: "bg-purple-500" },
+  math_compute: { bg: "bg-emerald-900/30", text: "text-emerald-300", bar: "bg-emerald-500" },
+};
+
+function toolStyle(tool: string) {
+  return TOOL_COLORS[tool] ?? { bg: "bg-slate-800/40", text: "text-slate-300", bar: "bg-slate-500" };
 }
 
-function buildTimeline(rec: ExecutionRecord): TimelineStep[] {
-  const started = new Date(rec.startedAt).getTime();
-  const finished = new Date(rec.finishedAt).getTime();
-  return [
-    { label: "Request Received", ts: rec.startedAt, status: "done" },
-    { label: "Queue Started", ts: rec.startedAt, durationMs: 0, status: "done" },
-    { label: "Pod Acquired", ts: rec.startedAt, durationMs: 10, status: "done" },
-    { label: "Tool Started", ts: rec.startedAt, durationMs: 20, status: "done" },
-    {
-      label: "Tool Returned",
-      ts: rec.finishedAt,
-      durationMs: rec.durationMs,
-      status: rec.status === "completed" ? "done" : "error",
-    },
-    { label: "Response Sent", ts: rec.finishedAt, durationMs: finished - started, status: rec.status === "completed" ? "done" : "error" },
-  ];
+function buildItems(messages: ChatMessage[], live: ToolCallLiveEvent[]): TraceItem[] {
+  const items: TraceItem[] = [];
+  const committed = new Set<string>();
+  let turn = 0;
+
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      turn++;
+      items.push({ kind: "user", id: msg.id, content: msg.content, createdAt: msg.createdAt, turnIndex: turn });
+    } else {
+      let tcs: ParsedToolCall[] = [];
+      if (msg.toolCalls) { try { tcs = JSON.parse(msg.toolCalls); } catch {} }
+      for (const tc of tcs) {
+        committed.add(tc.toolCallId);
+        items.push({ kind: "tool_call", id: tc.toolCallId, tc, turnIndex: turn });
+      }
+      items.push({
+        kind: "assistant",
+        id: msg.id,
+        content: msg.content,
+        createdAt: msg.createdAt,
+        toolCount: tcs.length,
+        totalToolMs: tcs.reduce((s, t) => s + t.durationMs, 0),
+        turnIndex: turn,
+      });
+    }
+  }
+
+  // Pending live tool calls not yet committed to any message
+  for (const l of live) {
+    if (!committed.has(l.toolCallId)) {
+      items.push({
+        kind: "tool_call",
+        id: l.toolCallId,
+        live: true,
+        tc: {
+          toolCallId: l.toolCallId,
+          tool: l.tool,
+          input: l.input,
+          output: l.output,
+          status: l.status,
+          pod: l.pod,
+          durationMs: l.durationMs,
+          queueWaitMs: l.queueWaitMs,
+        },
+        turnIndex: turn > 0 ? turn : 1,
+      });
+    }
+  }
+
+  return items;
 }
+
+// ─── Left panel: timeline item row ───────────────────────────────────────────
+
+function TimelineRow({
+  item,
+  selected,
+  maxMs,
+  onClick,
+}: {
+  item: TraceItem;
+  selected: boolean;
+  maxMs: number;
+  onClick: () => void;
+}) {
+  const isUser   = item.kind === "user";
+  const isAssist = item.kind === "assistant";
+  const isTool   = item.kind === "tool_call";
+
+  const durationMs = isTool ? item.tc.durationMs : 0;
+  const barPct     = maxMs > 0 ? Math.min(100, (durationMs / maxMs) * 100) : 0;
+  const style      = isTool ? toolStyle(item.tc.tool) : null;
+
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "w-full text-left px-3 py-2 rounded-md transition-colors group",
+        selected ? "bg-violet-900/20 border border-violet-800/40" : "hover:bg-[#1a1a1a] border border-transparent"
+      )}
+    >
+      <div className="flex items-center gap-2">
+        {/* Icon */}
+        {isUser && <User size={11} className="text-slate-500 shrink-0" />}
+        {isAssist && <Bot size={11} className="text-violet-400 shrink-0" />}
+        {isTool && <Terminal size={11} className={cn("shrink-0", style!.text)} />}
+
+        {/* Label */}
+        <span className={cn("text-xs truncate flex-1", selected ? "text-slate-200" : "text-slate-400 group-hover:text-slate-200")}>
+          {isUser   && "User Prompt"}
+          {isAssist && "LLM Response"}
+          {isTool   && (
+            <span className={cn("font-mono font-medium", style!.text)}>{item.tc.tool}</span>
+          )}
+          {isTool && item.live && (
+            <span className="ml-1.5 text-[9px] text-emerald-400 bg-emerald-900/30 px-1 py-0.5 rounded">live</span>
+          )}
+        </span>
+
+        {/* Duration */}
+        {isTool && (
+          <span className="text-[10px] text-slate-600 shrink-0 font-mono">{formatMs(durationMs)}</span>
+        )}
+        {isUser   && <span className="text-[10px] text-slate-700 shrink-0">—</span>}
+        {isAssist && <span className="text-[10px] text-slate-600 shrink-0 font-mono">{formatMs(item.totalToolMs)}</span>}
+      </div>
+
+      {/* Duration bar */}
+      {isTool && barPct > 0 && (
+        <div className="mt-1 h-0.5 bg-[#222] rounded-full overflow-hidden">
+          <div
+            className={cn("h-full rounded-full transition-all", style!.bar)}
+            style={{ width: `${barPct}%` }}
+          />
+        </div>
+      )}
+
+      {/* Preview text */}
+      {(isUser || isAssist) && (
+        <p className="text-[10px] text-slate-600 truncate mt-0.5 pl-[19px]">
+          {item.content.slice(0, 80)}
+        </p>
+      )}
+      {isTool && (
+        <div className={cn("ml-[19px] mt-0.5 flex items-center gap-1")}>
+          {item.tc.status === "completed"
+            ? <CheckCircle2 size={9} className="text-emerald-500" />
+            : <XCircle size={9} className="text-red-500" />
+          }
+          {item.tc.pod && (
+            <span className="text-[10px] text-slate-700 font-mono">
+              {item.tc.pod.replace("sandbox-runner-", "pod-")}
+            </span>
+          )}
+        </div>
+      )}
+    </button>
+  );
+}
+
+// ─── Right panel: detail view ─────────────────────────────────────────────────
+
+function DetailPanel({ item }: { item: TraceItem | null }) {
+  if (!item) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-slate-700 text-sm">
+        Select an item to inspect
+      </div>
+    );
+  }
+
+  if (item.kind === "user") {
+    return (
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+        <SectionHeader icon={<User size={13} className="text-slate-400" />} label="User Prompt" />
+        <KVRow label="Time" value={formatTime(item.createdAt)} />
+        <KVRow label="Words" value={String(item.content.trim().split(/\s+/).length)} />
+        <div>
+          <FieldLabel>Content</FieldLabel>
+          <pre className="bg-[#111] border border-[#2a2a2a] rounded-lg px-4 py-3 text-sm text-slate-200 whitespace-pre-wrap font-sans">
+            {item.content}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === "assistant") {
+    return (
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+        <SectionHeader icon={<Bot size={13} className="text-violet-400" />} label="LLM Response" />
+        <div className="grid grid-cols-2 gap-3">
+          <KVRow label="Time" value={formatTime(item.createdAt)} />
+          <KVRow label="Tool calls" value={String(item.toolCount)} />
+          <KVRow label="Total tool time" value={formatMs(item.totalToolMs)} />
+          <KVRow label="Words" value={String(item.content.trim().split(/\s+/).length)} />
+        </div>
+        <div>
+          <FieldLabel>Response</FieldLabel>
+          <pre className="bg-[#111] border border-[#2a2a2a] rounded-lg px-4 py-3 text-sm text-slate-200 whitespace-pre-wrap font-sans max-h-96 overflow-y-auto">
+            {item.content || "(no text response)"}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  // Tool call
+  const { tc, live } = item;
+  const style = toolStyle(tc.tool);
+
+  return (
+    <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+      {/* Header */}
+      <div className="flex items-center gap-3">
+        <SectionHeader icon={<Terminal size={13} className={style.text} />} label="Tool Call" />
+        <span className={cn("px-2 py-0.5 rounded text-[11px] font-semibold font-mono border", style.bg, style.text, "border-current/20")}>
+          {tc.tool}
+        </span>
+        {tc.status === "completed"
+          ? <span className="flex items-center gap-1 text-[11px] text-emerald-400 bg-emerald-900/20 px-2 py-0.5 rounded"><CheckCircle2 size={10} /> completed</span>
+          : <span className="flex items-center gap-1 text-[11px] text-red-400 bg-red-900/20 px-2 py-0.5 rounded"><XCircle size={10} /> failed</span>
+        }
+        {live && <span className="text-[11px] text-emerald-400 animate-pulse">● live</span>}
+      </div>
+
+      {/* Infrastructure */}
+      <div>
+        <FieldLabel>Infrastructure</FieldLabel>
+        <div className="grid grid-cols-2 gap-2 mt-2">
+          {[
+            { icon: <Server size={11} />, label: "Pod", value: tc.pod?.replace("sandbox-runner-", "pod-") ?? "local" },
+            { icon: <Clock size={11} />, label: "Duration", value: formatMs(tc.durationMs) },
+            { icon: <Zap size={11} />, label: "Queue wait", value: tc.queueWaitMs != null ? formatMs(tc.queueWaitMs) : "—" },
+            { icon: <Hash size={11} />, label: "Tool Call ID", value: tc.toolCallId.slice(0, 12) + "…" },
+          ].map(({ icon, label, value }) => (
+            <div key={label} className="flex items-start gap-1.5 bg-[#111] border border-[#2a2a2a] rounded-md px-3 py-2">
+              <span className="text-slate-600 mt-0.5">{icon}</span>
+              <div>
+                <div className="text-[10px] text-slate-600">{label}</div>
+                <div className="text-xs font-mono text-slate-300">{value}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Input */}
+      <div>
+        <FieldLabel>Input Parameters</FieldLabel>
+        <pre className="bg-[#111] border border-[#2a2a2a] rounded-lg px-4 py-3 text-xs text-slate-300 font-mono whitespace-pre-wrap overflow-x-auto">
+          {Object.keys(tc.input ?? {}).length === 0
+            ? "(no parameters)"
+            : JSON.stringify(tc.input, null, 2)}
+        </pre>
+      </div>
+
+      {/* Output */}
+      <div>
+        <FieldLabel>Output</FieldLabel>
+        <pre className={cn(
+          "bg-[#111] border rounded-lg px-4 py-3 text-xs font-mono whitespace-pre-wrap max-h-64 overflow-y-auto",
+          tc.status === "completed" ? "border-[#2a2a2a] text-slate-300" : "border-red-900/40 text-red-300"
+        )}>
+          {tc.output || "(empty)"}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tiny shared components ───────────────────────────────────────────────────
+
+function SectionHeader({ icon, label }: { icon: React.ReactNode; label: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      {icon}
+      <span className="text-xs font-semibold text-slate-300 uppercase tracking-wide">{label}</span>
+    </div>
+  );
+}
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-1.5">{children}</div>;
+}
+
+function KVRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="bg-[#111] border border-[#2a2a2a] rounded-md px-3 py-2">
+      <div className="text-[10px] text-slate-600">{label}</div>
+      <div className="text-xs text-slate-300 font-mono">{value}</div>
+    </div>
+  );
+}
+
+// ─── Main page ────────────────────────────────────────────────────────────────
 
 export function TraceDetailPage() {
-  const { id } = useParams<{ id: string }>();
+  const { id: sessionId } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [record, setRecord] = useState<ExecutionRecord | null>(null);
+
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [liveToolCalls, setLiveToolCalls] = useState<ToolCallLiveEvent[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
+  function fetchMessages() {
+    if (!sessionId) return;
+    fetch(`/chats/${sessionId}`)
+      .then((r) => r.json())
+      .then((d) => setMessages(d.messages ?? []))
+      .catch(() => {});
+  }
+
   useEffect(() => {
-    if (!id) return;
-    // Fetch all executions and find this one (no individual endpoint needed)
-    fetch("/executions?limit=200")
+    if (!sessionId) return;
+    setLoading(true);
+    setMessages([]);
+    setLiveToolCalls([]);
+    setSelectedId(null);
+    fetch(`/chats/${sessionId}`)
       .then((r) => r.json())
       .then((d) => {
-        const found = (d.executions ?? []).find((e: ExecutionRecord) => e.id === id);
-        setRecord(found ?? null);
+        const msgs: ChatMessage[] = d.messages ?? [];
+        setMessages(msgs);
+        // Auto-select first item
+        if (msgs.length > 0) setSelectedId(msgs[0].id);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [id]);
+  }, [sessionId]);
+
+  useWebSocket(useCallback((ev) => {
+    if (ev.type === "tool_call_update" && ev.data.sessionId === sessionId) {
+      setLiveToolCalls((prev) => {
+        const exists = prev.some((t) => t.toolCallId === ev.data.toolCallId);
+        if (exists) return prev;
+        const next = [...prev, ev.data];
+        setSelectedId(ev.data.toolCallId);
+        return next;
+      });
+      setTimeout(fetchMessages, 1500);
+    }
+    if (ev.type === "execution_update") {
+      const d = ev.data as { sessionId?: string };
+      if (d.sessionId === sessionId) fetchMessages();
+    }
+  }, [sessionId]));
+
+  const items = buildItems(messages, liveToolCalls);
+  const maxMs = Math.max(1, ...items.filter((i) => i.kind === "tool_call").map((i) => (i as Extract<TraceItem, { kind: "tool_call" }>).tc.durationMs));
+  const selected = items.find((i) => i.id === selectedId) ?? null;
+
+  // Stats for header
+  const toolItems = items.filter((i): i is Extract<TraceItem, { kind: "tool_call" }> => i.kind === "tool_call");
+  const totalMs = toolItems.reduce((s, i) => s + i.tc.durationMs, 0);
+  const failCount = toolItems.filter((i) => i.tc.status === "failed").length;
+
+  // Group items by turn for dividers
+  let lastTurn = -1;
 
   if (loading) return (
     <div className="flex-1 bg-[#0d0d0d] flex items-center justify-center text-slate-600 text-sm">
@@ -71,186 +398,69 @@ export function TraceDetailPage() {
     </div>
   );
 
-  if (!record) return (
-    <div className="flex-1 bg-[#0d0d0d] flex flex-col items-center justify-center gap-3">
-      <XCircle size={28} className="text-slate-700" />
-      <span className="text-slate-600 text-sm">Trace not found</span>
-      <button onClick={() => navigate("/traces")} className="text-violet-400 text-sm hover:text-violet-300">
-        ← Back to traces
+  if (!loading && messages.length === 0) return (
+    <div className="flex-1 bg-[#0d0d0d] flex flex-col items-center justify-center gap-2">
+      <Layers size={28} className="text-slate-700" />
+      <span className="text-slate-600 text-sm">No messages in this session yet</span>
+      <button onClick={() => navigate("/traces")} className="text-violet-400 text-xs hover:text-violet-300 mt-1">
+        ← Back
       </button>
     </div>
   );
 
-  const timeline = buildTimeline(record);
-  const podNum = record.pod.replace("sandbox-runner-", "");
-
   return (
-    <div className="flex-1 bg-[#0d0d0d] overflow-y-auto">
-      {/* Header */}
-      <div className="border-b border-[#2a2a2a] px-6 py-4">
-        <div className="flex items-center gap-3 mb-3">
-          <button
-            onClick={() => navigate("/traces")}
-            className="text-slate-600 hover:text-slate-300 transition-colors"
-          >
-            <ArrowLeft size={16} />
-          </button>
-          <span className="font-mono text-xs text-slate-500 truncate">{record.requestId}</span>
-          <span className={cn(
-            "text-[10px] px-2 py-0.5 rounded-full font-medium",
-            record.status === "completed"
-              ? "bg-emerald-900/40 text-emerald-400 border border-emerald-800/50"
-              : "bg-red-900/40 text-red-400 border border-red-800/50"
-          )}>
-            {record.status}
+    <div className="flex-1 flex flex-col overflow-hidden bg-[#0d0d0d]">
+      {/* Header bar */}
+      <div className="shrink-0 border-b border-[#2a2a2a] px-5 py-3 flex items-center gap-4">
+        <button onClick={() => navigate("/traces")} className="text-slate-600 hover:text-slate-300 transition-colors">
+          <ArrowLeft size={15} />
+        </button>
+        <span className="font-mono text-[11px] text-slate-500 truncate max-w-xs">{sessionId}</span>
+        <div className="flex items-center gap-3 ml-auto text-[11px]">
+          <span className="flex items-center gap-1 text-slate-500">
+            <Layers size={11} /> {toolItems.length} tool calls
           </span>
-        </div>
-
-        <div className="flex items-center gap-6 text-[11px] text-slate-500">
-          <span className="flex items-center gap-1.5">
-            <Hash size={11} /> Session: <span className="font-mono text-slate-400">{record.sessionId}</span>
+          <span className="flex items-center gap-1 text-slate-500">
+            <Clock size={11} /> {formatMs(totalMs)} total
           </span>
-          <span className="flex items-center gap-1.5">
-            <Calendar size={11} /> {formatTime(record.startedAt)}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <Clock size={11} /> {formatMs(record.durationMs)}
-          </span>
-          <span className="flex items-center gap-1.5">
-            <Server size={11} /> pod-{podNum}
-          </span>
+          {failCount > 0 && (
+            <span className="flex items-center gap-1 text-red-400">
+              <XCircle size={11} /> {failCount} failed
+            </span>
+          )}
         </div>
       </div>
 
-      {/* Body: 3 columns */}
-      <div className="flex gap-0 divide-x divide-[#1e1e1e] min-h-0">
-        {/* Left: Timeline */}
-        <div className="w-56 shrink-0 px-4 py-5">
-          <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-4">Execution Timeline</div>
-          <div className="relative">
-            {/* Vertical line */}
-            <div className="absolute left-2 top-3 bottom-3 w-px bg-[#2a2a2a]" />
-            <div className="space-y-5">
-              {timeline.map((step, i) => (
-                <div key={i} className="flex items-start gap-3 relative">
-                  <div className={cn(
-                    "w-4 h-4 rounded-full border flex items-center justify-center shrink-0 z-10 bg-[#0d0d0d]",
-                    step.status === "done" ? "border-emerald-600" : step.status === "error" ? "border-red-600" : "border-[#2a2a2a]"
-                  )}>
-                    <div className={cn(
-                      "w-1.5 h-1.5 rounded-full",
-                      step.status === "done" ? "bg-emerald-500" : step.status === "error" ? "bg-red-500" : "bg-slate-600"
-                    )} />
+      {/* Split body */}
+      <div className="flex-1 flex overflow-hidden min-h-0">
+        {/* Left: timeline */}
+        <div className="w-72 shrink-0 border-r border-[#2a2a2a] overflow-y-auto px-2 py-3 space-y-0.5">
+          {items.map((item) => {
+            const showDivider = item.turnIndex !== lastTurn;
+            if (showDivider) lastTurn = item.turnIndex;
+            return (
+              <div key={item.id}>
+                {showDivider && (
+                  <div className="flex items-center gap-2 px-3 pt-3 pb-1">
+                    <div className="flex-1 h-px bg-[#2a2a2a]" />
+                    <span className="text-[9px] text-slate-700 uppercase tracking-widest">Turn {item.turnIndex}</span>
+                    <div className="flex-1 h-px bg-[#2a2a2a]" />
                   </div>
-                  <div>
-                    <div className="text-xs text-slate-300">{step.label}</div>
-                    <div className="text-[10px] text-slate-600 font-mono">
-                      {step.durationMs !== undefined ? `+${step.durationMs}ms` : formatTime(step.ts)}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+                )}
+                <TimelineRow
+                  item={item}
+                  selected={selectedId === item.id}
+                  maxMs={maxMs}
+                  onClick={() => setSelectedId(item.id)}
+                />
+              </div>
+            );
+          })}
         </div>
 
-        {/* Center: Args + Output */}
-        <div className="flex-1 min-w-0 px-5 py-5 space-y-5">
-          {/* Arguments */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-2">
-              Tool Name · Arguments
-            </div>
-            <div className="flex items-center gap-2 mb-3">
-              <Terminal size={13} className="text-violet-400" />
-              <span className="font-mono text-sm text-violet-300">{record.tool}</span>
-            </div>
-            <pre className="bg-[#141414] border border-[#2a2a2a] rounded-lg px-4 py-3 text-xs text-slate-300 font-mono overflow-x-auto">
-              {JSON.stringify(record.input, null, 2)}
-            </pre>
-          </div>
-
-          {/* Stdout */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-2">Stdout / Output</div>
-            <pre className={cn(
-              "bg-[#141414] border rounded-lg px-4 py-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap max-h-48",
-              record.status === "completed" ? "border-[#2a2a2a] text-slate-300" : "border-red-900/40 text-red-300"
-            )}>
-              {record.output || "(empty)"}
-            </pre>
-          </div>
-
-          {/* Result summary */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-2">Result Summary</div>
-            <div className="flex items-center gap-2">
-              {record.status === "completed"
-                ? <CheckCircle2 size={14} className="text-emerald-500" />
-                : <XCircle size={14} className="text-red-500" />
-              }
-              <span className="text-sm text-slate-300">
-                {record.status === "completed" ? "Execution completed successfully" : "Execution failed"}
-              </span>
-              <span className="text-slate-600 text-xs ml-auto">in {formatMs(record.durationMs)}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Right: Infra context */}
-        <div className="w-56 shrink-0 px-4 py-5 space-y-5">
-          {/* Pod context */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-3">Infrastructure</div>
-            <div className="space-y-2.5">
-              {[
-                { icon: Server, label: "Pod", value: `sandbox-${podNum}` },
-                { icon: Cpu, label: "Tool", value: record.tool },
-                { icon: Clock, label: "Duration", value: formatMs(record.durationMs) },
-              ].map(({ icon: Icon, label, value }) => (
-                <div key={label} className="flex items-start gap-2">
-                  <Icon size={12} className="text-slate-600 mt-0.5 shrink-0" />
-                  <div>
-                    <div className="text-[10px] text-slate-600">{label}</div>
-                    <div className="text-xs font-mono text-slate-300">{value}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* IDs */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-3">IDs</div>
-            <div className="space-y-2.5">
-              {[
-                { label: "Request", value: record.requestId.slice(0, 12) + "…" },
-                { label: "ToolCall", value: record.toolCallId.slice(0, 12) + "…" },
-                { label: "Session", value: record.sessionId.slice(0, 12) + "…" },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <div className="text-[10px] text-slate-600">{label}</div>
-                  <div className="text-xs font-mono text-slate-400">{value}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Timestamps */}
-          <div>
-            <div className="text-[10px] uppercase tracking-widest text-slate-600 mb-3">Timestamps</div>
-            <div className="space-y-2">
-              {[
-                { label: "Started", value: formatTime(record.startedAt) },
-                { label: "Finished", value: formatTime(record.finishedAt) },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <div className="text-[10px] text-slate-600">{label}</div>
-                  <div className="text-xs text-slate-400">{value}</div>
-                </div>
-              ))}
-            </div>
-          </div>
+        {/* Right: detail */}
+        <div className="flex-1 overflow-hidden flex flex-col">
+          <DetailPanel item={selected} />
         </div>
       </div>
     </div>
