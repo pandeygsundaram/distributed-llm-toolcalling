@@ -13,7 +13,7 @@ Examples:
 
 ## Tools
 
-- **shell_run** — run a shell command in the pod. Allowed: pwd, ls, cat, whoami, node.
+- **shell_run** — run a shell command in the pod. Allowed: pwd, ls, cat, whoami, node, sleep.
 - **fs_read** — read a file from the pod by path.
 - **fs_write** — write content to a file in the pod. ALWAYS requires human approval — the user will see a preview modal and must approve before the write happens. If rejected, do not retry without asking the user.
 - **math_compute** — run a math operation inside the pod (add, subtract, multiply, divide, modulo, power, sqrt, factorial, fibonacci, is_prime, gcd). The computation executes in the pod via Node.js. Use this for any arithmetic the user asks for.
@@ -195,7 +195,7 @@ export class PiClient {
     const shellRunTool = defineTool({
       name: "shell_run",
       label: "Shell Run",
-      description: "Run an allowlisted shell command in the sandbox. Allowed: pwd, ls, cat, whoami, node --version.",
+      description: "Run an allowlisted shell command in the sandbox. Allowed: pwd, ls, cat, whoami, node --version, sleep <seconds>.",
       parameters: Type.Object({
         command: Type.Union([
           Type.Literal("pwd"),
@@ -203,6 +203,7 @@ export class PiClient {
           Type.Literal("cat"),
           Type.Literal("whoami"),
           Type.Literal("node"),
+          Type.Literal("sleep"),
         ], { description: "The command to run" }),
         args: Type.Optional(Type.Array(Type.String(), { description: "Command arguments" })),
       }),

@@ -4,7 +4,7 @@ import path from "path";
 
 const execFileAsync = promisify(execFile);
 
-const ALLOWED_COMMANDS = ["pwd", "ls", "cat", "node", "whoami"] as const;
+const ALLOWED_COMMANDS = ["pwd", "ls", "cat", "node", "whoami", "sleep"] as const;
 type AllowedCommand = (typeof ALLOWED_COMMANDS)[number];
 
 const ALLOWED_ARGS: Record<AllowedCommand, (args: string[]) => boolean> = {
@@ -13,6 +13,7 @@ const ALLOWED_ARGS: Record<AllowedCommand, (args: string[]) => boolean> = {
   cat: (args) => args.length === 1 && !args[0].includes(".."),
   node: (args) => args.length === 1 && args[0] === "--version",
   whoami: (args) => args.length === 0,
+  sleep: (args) => args.length === 1 && /^\d+$/.test(args[0]) && Number(args[0]) <= 60,
 };
 
 export interface ShellRunInput {

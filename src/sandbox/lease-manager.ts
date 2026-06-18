@@ -156,18 +156,21 @@ export class LeaseManager {
 
   async annotatePod(podName: string, toolCallId: string): Promise<void> {
     try {
-      await this.coreApi.patchNamespacedPod({
-        name: podName,
-        namespace: this.namespace,
-        body: {
-          metadata: {
-            annotations: {
-              "sandbox.ai/current-tool-id": toolCallId,
-              "sandbox.ai/tool-started-at": new Date().toISOString(),
+      await Promise.race([
+        this.coreApi.patchNamespacedPod({
+          name: podName,
+          namespace: this.namespace,
+          body: {
+            metadata: {
+              annotations: {
+                "sandbox.ai/current-tool-id": toolCallId,
+                "sandbox.ai/tool-started-at": new Date().toISOString(),
+              },
             },
           },
-        },
-      });
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("annotate timeout")), 3_000)),
+      ]);
     } catch {
       // non-fatal
     }
@@ -175,18 +178,21 @@ export class LeaseManager {
 
   async clearAnnotations(podName: string): Promise<void> {
     try {
-      await this.coreApi.patchNamespacedPod({
-        name: podName,
-        namespace: this.namespace,
-        body: {
-          metadata: {
-            annotations: {
-              "sandbox.ai/current-tool-id": null,
-              "sandbox.ai/tool-started-at": null,
+      await Promise.race([
+        this.coreApi.patchNamespacedPod({
+          name: podName,
+          namespace: this.namespace,
+          body: {
+            metadata: {
+              annotations: {
+                "sandbox.ai/current-tool-id": null,
+                "sandbox.ai/tool-started-at": null,
+              },
             },
           },
-        },
-      });
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("clear-annotations timeout")), 3_000)),
+      ]);
     } catch {
       // non-fatal
     }

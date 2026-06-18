@@ -4,42 +4,36 @@ metadata:
   name: sandbox-runner-hpa
   namespace: sendai
 spec:
-  # Scale the sandbox pod pool — more pods = more parallel tool executions
   scaleTargetRef:
     apiVersion: apps/v1
     kind: StatefulSet
     name: sandbox-runner
-  minReplicas: 4
+  minReplicas: 8
   maxReplicas: 32
   metrics:
-    # Primary: scale up when queue depth exceeds 2 waiting jobs per pod
+    # Scale based on queue depth — exposed by prometheus-adapter reading
+    # the queue_depth gauge from GET /metrics/prometheus on sendai-api.
+    # AverageValue: keep average queue depth per pod <= 2 waiting jobs.
     - type: External
       external:
         metric:
-          name: redis_stream_length
+          name: sendai_queue_depth
           selector:
             matchLabels:
-              stream: tool-calls
+              namespace: sendai
         target:
           type: AverageValue
           averageValue: "2"
-    # Secondary: CPU-based scaling (no prometheus-adapter required)
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
   behavior:
     scaleUp:
-      stabilizationWindowSeconds: 30   # scale up quickly when queue fills
+      stabilizationWindowSeconds: 0    # no wait — scale immediately
       policies:
         - type: Pods
-          value: 4
-          periodSeconds: 60
+          value: 32                    # allow full jump to 32 in one shot
+          periodSeconds: 15
     scaleDown:
-      stabilizationWindowSeconds: 300  # scale down slowly — avoid thrash
+      stabilizationWindowSeconds: 120  # drain queue before shrinking
       policies:
         - type: Pods
           value: 2
-          periodSeconds: 120
+          periodSeconds: 60

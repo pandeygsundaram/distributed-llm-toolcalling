@@ -44,11 +44,17 @@ export class PodExecutor {
     return result;
   }
 
-  // Wipe sandbox files between leases so tenants don't see each other's data
+  // Wipe sandbox files between leases so tenants don't see each other's data.
+  // 5s hard cap — cleanup is best-effort and must never block xack.
   async cleanup(podName: string): Promise<void> {
-    await this.execInPod(podName, [
-      "sh", "-c",
-      `rm -rf ${SANDBOX_DIR}/* ${SANDBOX_DIR}/.[!.]* 2>/dev/null; true`,
+    await Promise.race([
+      this.execInPod(podName, [
+        "sh", "-c",
+        `rm -rf ${SANDBOX_DIR}/* ${SANDBOX_DIR}/.[!.]* 2>/dev/null; true`,
+      ]),
+      new Promise<PodToolResult>((resolve) =>
+        setTimeout(() => resolve({ stdout: "", stderr: "", exitCode: 0 }), 5_000)
+      ),
     ]);
     logger.info({ pod: podName }, "sandbox.cleanup.done");
   }

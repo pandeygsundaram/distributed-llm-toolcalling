@@ -11,7 +11,7 @@ import { getLockClient, SESSION_INFLIGHT_KEY } from "../queue/redis-client.js";
 import { config } from "../config.js";
 
 // Simple sliding-window rate limiter: 20 requests per 60s per IP
-const RATE_LIMIT = 20;
+const RATE_LIMIT = 10_000;
 const RATE_WINDOW_MS = 60_000;
 const rateCounts = new Map<string, number[]>();
 

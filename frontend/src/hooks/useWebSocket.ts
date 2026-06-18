@@ -21,7 +21,8 @@ export type WSEvent =
   | { type: "execution_update"; data: ExecutionRecord }
   | { type: "tool_call_update"; data: ToolCallLiveEvent }
   | { type: "queue_update"; data: { depth: number; waiters: number } }
-  | { type: "permission_request"; data: unknown };
+  | { type: "permission_request"; data: unknown }
+  | { type: "hpa_update"; data: { currentReplicas: number; desiredReplicas: number; minReplicas: number; maxReplicas: number } };
 
 export interface PodState {
   name: string;

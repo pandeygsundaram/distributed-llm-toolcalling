@@ -7,7 +7,8 @@ type SSEEvent =
   | { type: "tool_call_update"; data: unknown }
   | { type: "metrics_update"; data: unknown }
   | { type: "queue_update"; data: { depth: number; waiters: number } }
-  | { type: "permission_request"; data: unknown };
+  | { type: "permission_request"; data: unknown }
+  | { type: "hpa_update"; data: unknown };
 
 class Broadcaster {
   private clients = new Set<Response>();

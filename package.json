@@ -15,6 +15,9 @@
     "stress": "tsx tests/stress/stress.ts",
     "stress:concurrent": "tsx tests/stress/concurrent.ts",
     "stress:limits": "tsx tests/stress/limits.ts",
+    "stress:via-claude": "node tests/stress/hpa-stress.mjs",
+    "stress:via-claude:1000": "node tests/stress/hpa-1000.mjs",
+    "stress:direct-queue": "node tests/stress/infra-stress.mjs",
     "practice:redis": "vitest run practice/01-redis-pod-reservation.test.ts --reporter=verbose",
     "practice:k8s": "vitest run practice/02-k8s-lease-renewal.test.ts --reporter=verbose --test-timeout=30000"
   },

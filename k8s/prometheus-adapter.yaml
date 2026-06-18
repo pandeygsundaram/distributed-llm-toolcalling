@@ -1,0 +1,187 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-adapter
+  namespace: sendai
+---
+# Lets the adapter delegate auth decisions to the k8s API
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-adapter:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: sendai
+---
+# Lets the adapter read auth info from kube-system
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-adapter-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: sendai
+---
+# Lets the adapter read pods/namespaces to associate metrics with k8s objects
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-adapter-resource-reader
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, services, namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-adapter-resource-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-adapter-resource-reader
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-adapter
+    namespace: sendai
+---
+# Lets HPA (and kubectl) query external metrics via this adapter
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-metrics-reader
+rules:
+  - apiGroups: [external.metrics.k8s.io]
+    resources: ["*"]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: horizontal-pod-autoscaler
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: sendai
+data:
+  config.yaml: |
+    # Expose queue_depth as an External metric so HPA can use it
+    # without needing to associate it with a specific k8s object.
+    externalRules:
+      - seriesQuery: 'queue_depth'
+        resources:
+          overrides:
+            namespace: {resource: "namespace"}
+        name:
+          as: "sendai_queue_depth"
+        metricsQuery: 'max(queue_depth)'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-adapter
+  namespace: sendai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-adapter
+  template:
+    metadata:
+      labels:
+        app: prometheus-adapter
+    spec:
+      serviceAccountName: prometheus-adapter
+      initContainers:
+        # Generate a self-signed TLS cert for the adapter's API server
+        - name: gen-cert
+          image: alpine/openssl:latest
+          command:
+            - sh
+            - -c
+            - |
+              openssl req -new -x509 -days 3650 -nodes \
+                -keyout /tls/tls.key \
+                -out /tls/tls.crt \
+                -subj "/CN=prometheus-adapter.sendai.svc" && \
+              chmod 644 /tls/tls.key /tls/tls.crt
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+      containers:
+        - name: prometheus-adapter
+          image: registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.12.0
+          args:
+            - --prometheus-url=http://10.96.167.65:9090
+            - --metrics-relist-interval=30s
+            - --config=/etc/adapter/config.yaml
+            - --secure-port=6443
+            - --tls-cert-file=/tls/tls.crt
+            - --tls-private-key-file=/tls/tls.key
+          ports:
+            - containerPort: 6443
+          volumeMounts:
+            - name: config
+              mountPath: /etc/adapter
+            - name: tls
+              mountPath: /tls
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-adapter-config
+        - name: tls
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-adapter
+  namespace: sendai
+spec:
+  selector:
+    app: prometheus-adapter
+  ports:
+    - port: 443
+      targetPort: 6443
+---
+# Register the adapter as the external.metrics.k8s.io API provider
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.external.metrics.k8s.io
+spec:
+  service:
+    name: prometheus-adapter
+    namespace: sendai
+    port: 443
+  group: external.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true   # self-signed cert — fine for demo
+  groupPriorityMinimum: 100
+  versionPriority: 100

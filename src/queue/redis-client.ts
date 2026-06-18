@@ -73,10 +73,23 @@ export async function publishToolCall(job: ToolCallJob): Promise<string> {
   return id!;
 }
 
-// Publish result back to waiting API caller
+export const RESULT_DATA_KEY = (toolCallId: string) => `result-data:${toolCallId}`;
+
+// Publish result back to waiting API caller.
+// Dual delivery: persist to a Redis key first (via lockClient, separate connection),
+// then pub/sub publish with a 5s timeout so processJob always completes even if
+// the pub client connection is momentarily saturated.
 export async function publishResult(toolCallId: string, result: ToolCallJobResult): Promise<void> {
-  const client = getPubClient();
-  await client.publish(RESULT_CHANNEL(toolCallId), JSON.stringify(result));
+  const json = JSON.stringify(result);
+
+  // Persistent store — lockClient is a dedicated connection, never backed up by pub traffic
+  await getLockClient().setex(RESULT_DATA_KEY(toolCallId), 300, json).catch(() => {});
+
+  // Fire pub/sub — best-effort, 5s cap so we never block processJob
+  await Promise.race([
+    getPubClient().publish(RESULT_CHANNEL(toolCallId), json),
+    new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+  ]);
 }
 
 // Subscribe and wait for a result with timeout

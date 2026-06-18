@@ -17,6 +17,8 @@ import { registerExecutionRoutes } from "./routes/executions.js";
 import { registerCancelRoutes } from "./routes/cancel.js";
 import { registerChatHistoryRoutes } from "./routes/chats.js";
 import { registerApprovalRoutes } from "./routes/approve.js";
+import { getStreamClient, STREAM_KEY, CONSUMER_GROUP } from "./queue/redis-client.js";
+import * as k8s from "@kubernetes/client-node";
 
 async function main() {
   await initDb();
@@ -37,6 +39,11 @@ async function main() {
   }
 
   const piClient = new PiClient(executor);
+
+  // K8s autoscaling API for HPA replica count
+  const kc = new k8s.KubeConfig();
+  kc.loadFromDefault();
+  const autoscalingApi = kc.makeApiClient(k8s.AutoscalingV2Api);
 
   const app = express();
   app.use(express.json());
@@ -69,18 +76,67 @@ async function main() {
 
   const server = http.createServer(app);
 
-  // Broadcast pod + metrics state every 2s to connected SSE clients
+  // Poll HPA every 2s and broadcast replica count
+  let hpaTick = 0;
+  const HPA_POLL_EVERY = 10; // every 10 * 200ms = 2s
+  let lastHpa = { currentReplicas: 0, desiredReplicas: 0, minReplicas: 8, maxReplicas: 32 };
   setInterval(async () => {
-    if (broadcaster.clientCount() === 0) return;
+    if (hpaTick++ % HPA_POLL_EVERY !== 0) return;
+    try {
+      const hpaObj = await autoscalingApi.readNamespacedHorizontalPodAutoscaler({
+        name: "sandbox-runner-hpa",
+        namespace: config.K8S_NAMESPACE,
+      });
+      const cur = (hpaObj as any).status?.currentReplicas ?? 0;
+      const des = (hpaObj as any).status?.desiredReplicas ?? 0;
+      const mn = (hpaObj as any).spec?.minReplicas ?? 8;
+      const mx = (hpaObj as any).spec?.maxReplicas ?? 32;
+      lastHpa = { currentReplicas: cur, desiredReplicas: des, minReplicas: mn, maxReplicas: mx };
+      if (broadcaster.clientCount() > 0) {
+        broadcaster.broadcast({ type: "hpa_update", data: lastHpa });
+      }
+    } catch { /* not critical */ }
+  }, 200);
+
+  // Broadcast pod + metrics state every 200ms to connected SSE clients
+  setInterval(async () => {
     if (leaseManager) {
       const pods = await leaseManager.listLeaseStates().catch(() => []);
       const inUse = pods.filter((p) => p.lease.status === "leased").length;
       metrics.setPodsInUse(inUse);
-      metrics.setQueueDepth(leaseManager.queueDepth);
-      broadcaster.broadcast({ type: "pods_update", data: { pods } });
+
+      // In Redis mode: real queue depth = pending (in-flight at workers) + lag (undelivered in stream).
+      // pending = workers have the message but haven't ACKed (waiting for pod or executing)
+      // lag     = messages added after the group's last-delivered-id (no worker has read yet)
+      if (useRedis) {
+        try {
+          const redis = getStreamClient();
+          const [pendingRaw, groupInfoRaw] = await Promise.all([
+            redis.xpending(STREAM_KEY, CONSUMER_GROUP),
+            redis.xinfo("GROUPS", STREAM_KEY),
+          ]);
+          const pending = Array.isArray(pendingRaw) ? (pendingRaw[0] as number ?? 0) : 0;
+          // Parse flat XINFO GROUPS array: [name,v, consumers,v, pending,v, last-delivered-id,v, entries-read,v, lag,v]
+          let lag = 0;
+          if (Array.isArray(groupInfoRaw)) {
+            const flat = groupInfoRaw.flat();
+            const lagIdx = flat.indexOf("lag");
+            if (lagIdx !== -1) lag = Number(flat[lagIdx + 1]) || 0;
+          }
+          metrics.setQueueDepth(pending + lag);
+        } catch { metrics.setQueueDepth(0); }
+      } else {
+        metrics.setQueueDepth(leaseManager.queueDepth);
+      }
+
+      if (broadcaster.clientCount() > 0) {
+        broadcaster.broadcast({ type: "pods_update", data: { pods } });
+      }
     }
-    broadcaster.broadcast({ type: "metrics_update", data: metrics.snapshot() });
-  }, 2000);
+    if (broadcaster.clientCount() > 0) {
+      broadcaster.broadcast({ type: "metrics_update", data: metrics.snapshot() });
+    }
+  }, 200);
 
   server.listen(config.PORT, "0.0.0.0", () => {
     logger.info({ port: config.PORT, mode: useRedis ? "redis" : "local" }, "server started");

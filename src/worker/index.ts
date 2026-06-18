@@ -159,8 +159,8 @@ async function runWorker(): Promise<void> {
     try {
       const response = await redis.xreadgroup(
         "GROUP", CONSUMER_GROUP, CONSUMER_NAME,
-        "COUNT", "1",
-        "BLOCK", "5000",
+        "COUNT", "50",
+        "BLOCK", "1000",
         "STREAMS", STREAM_KEY, ">"
       ) as Array<[string, Array<[string, string[]]>]> | null;
 

@@ -53,6 +53,10 @@ const queueWaitSamples: Sample[] = [];
 let _queueDepth = 0;
 let _podsInUse = 0;
 
+// Rolling queue-depth history for the sparkline (last 60 points at 200ms = 12s)
+const QDEPTH_HISTORY_MAX = 120;
+const queueDepthHistory: { ts: number; v: number }[] = [];
+
 function prune(arr: Sample[]) {
   const cutoff = Date.now() - WINDOW_MS;
   while (arr.length && arr[0].ts < cutoff) arr.shift();
@@ -94,6 +98,8 @@ export const metrics = {
   setQueueDepth(n: number) {
     _queueDepth = n;
     queueDepthGauge.set(n);
+    queueDepthHistory.push({ ts: Date.now(), v: n });
+    if (queueDepthHistory.length > QDEPTH_HISTORY_MAX) queueDepthHistory.shift();
   },
 
   setPodsInUse(n: number) {
@@ -103,17 +109,25 @@ export const metrics = {
 
   snapshot() {
     const toolStats: Record<string, ReturnType<typeof stats> & { totalMs: number }> = {};
+    let totalRecentCalls = 0;
+    const now = Date.now();
+    const throughputWindowMs = 10_000;
     for (const [tool, samples] of toolSamples) {
       prune(samples);
       const totalMs = samples.reduce((s, x) => s + x.value, 0);
       toolStats[tool] = { ...stats(samples), totalMs };
+      totalRecentCalls += samples.filter(s => s.ts > now - throughputWindowMs).length;
     }
+    const callsPerSec = Math.round((totalRecentCalls / (throughputWindowMs / 1000)) * 10) / 10;
+
     return {
       window: "5m",
       queueDepth: _queueDepth,
       podsInUse: _podsInUse,
+      callsPerSec,
       queueWait: stats(queueWaitSamples),
       tools: toolStats,
+      queueDepthHistory: [...queueDepthHistory],
       generatedAt: new Date().toISOString(),
     };
   },

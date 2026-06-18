@@ -1,31 +1,14 @@
 import "dotenv/config";
-import * as k8s from "@kubernetes/client-node";
 import { RedisExecutor } from "../../src/executor/redis.js";
+import { getLockClient, POD_LOCK_KEY } from "../../src/queue/redis-client.js";
 import { v4 as uuid } from "uuid";
 
+// Forcibly clear all Redis pod locks so the next phase starts clean
 async function resetAllLeases() {
-  const kc = new k8s.KubeConfig();
-  kc.loadFromDefault();
-  const api = kc.makeApiClient(k8s.CoordinationV1Api);
-  const ns = process.env.K8S_NAMESPACE ?? "sendai";
+  const lock = getLockClient();
   const pods = Array.from({ length: 8 }, (_, i) => `sandbox-runner-${i}`);
-  await Promise.all(pods.map(async (name) => {
-    try {
-      const lease = await api.readNamespacedLease({ name, namespace: ns });
-      if (lease.spec?.holderIdentity) {
-        await api.replaceNamespacedLease({
-          name, namespace: ns,
-          body: {
-            apiVersion: "coordination.k8s.io/v1", kind: "Lease",
-            metadata: { name, namespace: ns, resourceVersion: lease.metadata?.resourceVersion },
-            spec: { holderIdentity: "", leaseDurationSeconds: 45,
-              renewTime: new Date().toISOString().replace(/(\.\d{3})Z$/, "$1000Z") as unknown as Date },
-          },
-        });
-      }
-    } catch { /* ignore */ }
-  }));
-  process.stdout.write("  [leases reset] ");
+  await Promise.all(pods.map((name) => lock.del(POD_LOCK_KEY(name)).catch(() => {})));
+  process.stdout.write("  [redis locks cleared] ");
 }
 
 const executor = new RedisExecutor();
